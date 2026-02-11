@@ -6,9 +6,12 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/random/random.h>
+
 #include <drivers/behavior.h>
+
 #include <zmk/behavior.h>
 #include <zmk/events/keycode_state_changed.h>
+
 #include <dt-bindings/zmk/keys.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -21,21 +24,26 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 /* Editor line layout (0-based):
  * 0: title
- * 1: score
+ * 1: score line
  * 2: blank
  * 3..: board rows (H lines)
  */
 #define BOARD_TOP_LINE_INDEX 3
 
 #define MAX_UPDATE_LINES 10
+#define UPDATE_TEXT_MAX 32  /* score line etc */
 
-/* gravity */
 static uint16_t idle_before_fall_ms = 2000;
 static uint16_t fall_interval_ms    = 700;
 
 /* clear effect */
-static uint8_t  clear_frames   = 4;   // 点滅回数
-static uint16_t clear_frame_ms = 110; // 点滅間隔
+static uint8_t  clear_frames   = 4;   // blink count
+static uint16_t clear_frame_ms = 110; // blink interval
+
+/* extra delays you requested */
+static uint16_t post_clear_spawn_delay_ms = 260;  // after rows cleared, before spawning next
+static uint16_t post_land_spawn_delay_ms  = 180;  // normal landing -> spawn delay
+static uint16_t post_hard_drop_delay_ms   = 260;  // hard drop landing -> spawn delay
 
 /* delays for editor ops (stability) */
 static uint32_t delay_for_char(char c) { return (c == '\n') ? 25 : 6; }
@@ -74,7 +82,8 @@ static bool char_to_keycode(char c, uint32_t *out) {
     case ' ': *out = SPACE; return true;
     case '\n': *out = ENTER; return true;
 
-    case '=': *out = EQUAL; return true;
+    /* JIS: '=' is UNDER in your environment */
+    case '=': *out = UNDER; return true;
     case '-': *out = MINUS; return true;
 
     case '0': *out = N0; return true;
@@ -119,8 +128,6 @@ static bool char_to_keycode(char c, uint32_t *out) {
     }
 }
 
-static void clear_editor_async_start(void); /* forward */
-
 /* ==============================
  * Game state (locked board + falling piece)
  * ============================== */
@@ -145,19 +152,28 @@ struct piece_state {
 };
 
 static struct piece_state falling;
+static bool has_falling; /* false during spawn-delay to avoid showing next piece */
 
-/* queued inputs while rendering / clear animation */
-static int pending_dx;
-static int pending_rot_cw;
-static int pending_rot_ccw;
+/* score */
+static uint32_t score;
+static uint16_t lines_cleared_total;
+
+/* queued inputs while rendering / clear animation / spawn delay */
+static int  pending_dx;
+static int  pending_rot_cw;
+static int  pending_rot_ccw;
 static bool pending_hard_drop;
-static int pending_soft_drop;
+static int  pending_soft_drop;
 static uint32_t last_input_ms;
 
 /* line clear state */
 static bool clearing;
 static uint16_t clear_mask;   // row bits
 static uint8_t clear_step;
+
+/* spawn delay */
+static uint16_t pending_spawn_delay_ms;
+static bool last_land_was_harddrop;
 
 /* ==============================
  * 4x4 masks (bit 0 = (0,0), bit 15 = (3,3))
@@ -201,19 +217,27 @@ static const uint16_t SHAPE[TET_COUNT][4] = {
         BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(2,3),
         BIT_AT(0,3) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,2),
     },
-    /* J */
+    /* J (fixed: not mixed with L) */
     {
+        /* rot 0: JJJ / J.. */
         BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,1),
-        BIT_AT(0,2) | BIT_AT(0,3) | BIT_AT(1,2) | BIT_AT(2,2),
+        /* rot 1: .J / .J / .JJ (top-right) */
+        BIT_AT(0,3) | BIT_AT(1,3) | BIT_AT(2,3) | BIT_AT(2,2),
+        /* rot 2: ..J / JJJ */
         BIT_AT(0,3) | BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3),
-        BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(2,1),
+        /* rot 3: JJ. / .J. / .J. (bottom-left) */
+        BIT_AT(0,2) | BIT_AT(0,3) | BIT_AT(1,3) | BIT_AT(2,3),
     },
-    /* L */
+    /* L (fixed) */
     {
+        /* rot 0: LLL / ..L */
         BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,3),
-        BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(0,3),
+        /* rot 1: .LL / .L. / .L. (top-right overhang) */
+        BIT_AT(0,2) | BIT_AT(0,3) | BIT_AT(1,2) | BIT_AT(2,2),
+        /* rot 2: L.. / LLL */
         BIT_AT(0,1) | BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3),
-        BIT_AT(2,2) | BIT_AT(0,1) | BIT_AT(1,1) | BIT_AT(2,1),
+        /* rot 3: .L. / .L. / LL. (bottom-left overhang) */
+        BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,1) | BIT_AT(2,2),
     },
 };
 
@@ -246,10 +270,10 @@ static const int8_t KICK_JLSTZ_CW[4][5][2] = {
     {{0,0},{-1,0},{-1,-1},{0,2},{-1,2}},  // 3->0
 };
 static const int8_t KICK_JLSTZ_CCW[4][5][2] = {
-    /* 0->3 */ {{0,0},{ 1,0},{ 1,1},{0,-2},{ 1,-2}},
-    /* 1->0 */ {{0,0},{ 1,0},{ 1,-1},{0,2},{ 1,2}},
-    /* 2->1 */ {{0,0},{-1,0},{-1,1},{0,-2},{-1,-2}},
-    /* 3->2 */ {{0,0},{-1,0},{-1,-1},{0,2},{-1,2}},
+    {{0,0},{ 1,0},{ 1,1},{0,-2},{ 1,-2}}, // 0->3
+    {{0,0},{ 1,0},{ 1,-1},{0,2},{ 1,2}},  // 1->0
+    {{0,0},{-1,0},{-1,1},{0,-2},{-1,-2}}, // 2->1
+    {{0,0},{-1,0},{-1,-1},{0,2},{-1,2}},  // 3->2
 };
 
 static const int8_t KICK_I_CW[4][5][2] = {
@@ -259,10 +283,10 @@ static const int8_t KICK_I_CW[4][5][2] = {
     {{0,0},{ 1,0},{-2,0},{ 1,-2},{-2,1}}, // 3->0
 };
 static const int8_t KICK_I_CCW[4][5][2] = {
-    /* 0->3 */ {{0,0},{-1,0},{ 2,0},{-1,2},{ 2,-1}},
-    /* 1->0 */ {{0,0},{ 2,0},{-1,0},{ 2,1},{-1,-2}},
-    /* 2->1 */ {{0,0},{ 1,0},{-2,0},{ 1,-2},{-2,1}},
-    /* 3->2 */ {{0,0},{-2,0},{ 1,0},{-2,-1},{ 1,2}},
+    {{0,0},{-1,0},{ 2,0},{-1,2},{ 2,-1}}, // 0->3
+    {{0,0},{ 2,0},{-1,0},{ 2,1},{-1,-2}}, // 1->0
+    {{0,0},{ 1,0},{-2,0},{ 1,-2},{-2,1}}, // 2->1
+    {{0,0},{-2,0},{ 1,0},{-2,-1},{ 1,2}}, // 3->2
 };
 
 static bool try_rotate(int dir /* +1 CW, -1 CCW */) {
@@ -293,6 +317,51 @@ static bool try_rotate(int dir /* +1 CW, -1 CCW */) {
 }
 
 /* ==============================
+ * Score line builder: "s 00000 l 000"
+ * ============================== */
+static char score_prev[UPDATE_TEXT_MAX];
+static char score_next[UPDATE_TEXT_MAX];
+
+static void build_score_next(void) {
+    uint32_t s = score;
+    if (s > 99999) s = 99999;
+    uint16_t l = lines_cleared_total;
+    if (l > 999) l = 999;
+
+    /* keep within UPDATE_TEXT_MAX */
+    int w = 0;
+    score_next[w++] = 's';
+    score_next[w++] = ' ';
+    score_next[w++] = '0' + ((s / 10000) % 10);
+    score_next[w++] = '0' + ((s / 1000) % 10);
+    score_next[w++] = '0' + ((s / 100) % 10);
+    score_next[w++] = '0' + ((s / 10) % 10);
+    score_next[w++] = '0' + (s % 10);
+    score_next[w++] = ' ';
+    score_next[w++] = 'l';
+    score_next[w++] = ' ';
+    score_next[w++] = '0' + ((l / 100) % 10);
+    score_next[w++] = '0' + ((l / 10) % 10);
+    score_next[w++] = '0' + (l % 10);
+    score_next[w++] = ' ';
+    score_next[w]   = '\0';
+}
+
+static bool score_equals(void) {
+    for (int i = 0; i < UPDATE_TEXT_MAX; i++) {
+        if (score_prev[i] != score_next[i]) return false;
+        if (score_next[i] == '\0') return true;
+    }
+    return true;
+}
+static void commit_score_line(void) {
+    for (int i = 0; i < UPDATE_TEXT_MAX; i++) {
+        score_prev[i] = score_next[i];
+        if (score_next[i] == '\0') break;
+    }
+}
+
+/* ==============================
  * Lock / clear / spawn
  * ============================== */
 static void lock_falling(void) {
@@ -317,6 +386,12 @@ static uint16_t detect_full_lines(void) {
         if (full) mask |= (1u << r);
     }
     return mask;
+}
+
+static uint8_t popcount16(uint16_t x) {
+    uint8_t n = 0;
+    while (x) { x &= (uint16_t)(x - 1); n++; }
+    return n;
 }
 
 static void apply_line_clear(uint16_t mask) {
@@ -348,24 +423,25 @@ static void spawn_piece(void) {
     falling.y = 0;
 
     if (!can_place(falling.type, falling.rot, falling.x, falling.y)) {
+        /* demo: wipe board on gameover */
         for (int r = 0; r < BOARD_H; r++) for (int c = 0; c < BOARD_W; c++) board_locked[r][c] = 0;
         falling.type = TET_O; falling.rot = 0; falling.x = 3; falling.y = 0;
     }
 }
 
 /* ==============================
- * Renderer: prev/next board lines (locked + falling overlay)
+ * Renderer: diff lines
  * ============================== */
 struct update_line {
     int line_index;
-    char text[BOARD_W + 2];   // ".......... " + '\0'
+    char text[UPDATE_TEXT_MAX];
 };
 
 static char render_prev[BOARD_H][BOARD_W + 2];
 static char render_next[BOARD_H][BOARD_W + 2];
 
 static void build_row_string(int row, char out[BOARD_W + 2]) {
-    /* clear effect overrides (no next piece during clearing) */
+    /* clear effect overrides; do NOT show next piece while clearing */
     if (clearing && (clear_mask & (1u << row))) {
         bool on = ((clear_step % 2) == 0);
         for (int c = 0; c < BOARD_W; c++) out[c] = on ? '=' : '.';
@@ -376,7 +452,8 @@ static void build_row_string(int row, char out[BOARD_W + 2]) {
 
     for (int c = 0; c < BOARD_W; c++) out[c] = board_locked[row][c] ? 'x' : '.';
 
-    if (!clearing) {
+    /* overlay falling only if allowed */
+    if (has_falling && !clearing) {
         uint16_t m = SHAPE[falling.type][falling.rot & 3];
         for (int r = 0; r < 4; r++) {
             int br = falling.y + r;
@@ -405,23 +482,27 @@ static bool row_equals(const char *a, const char *b) {
     return true;
 }
 
-static uint8_t make_diff_lines(struct update_line out[MAX_UPDATE_LINES]) {
+static uint8_t make_board_diff(struct update_line out[MAX_UPDATE_LINES]) {
     uint8_t n = 0;
     for (int r = 0; r < BOARD_H; r++) {
         if (row_equals(render_prev[r], render_next[r])) continue;
         if (n >= MAX_UPDATE_LINES) break;
 
         out[n].line_index = BOARD_TOP_LINE_INDEX + r;
-        for (int i = 0; i < BOARD_W + 2; i++) {
-            out[n].text[i] = render_next[r][i];
+
+        int w = 0;
+        for (int i = 0; i < BOARD_W + 2 && w + 1 < UPDATE_TEXT_MAX; i++) {
+            out[n].text[w++] = render_next[r][i];
             if (render_next[r][i] == '\0') break;
         }
+        out[n].text[UPDATE_TEXT_MAX - 1] = '\0';
 
         /* optimistic commit */
         for (int i = 0; i < BOARD_W + 2; i++) {
             render_prev[r][i] = render_next[r][i];
             if (render_next[r][i] == '\0') break;
         }
+
         n++;
     }
     return n;
@@ -466,6 +547,7 @@ static struct render_state rs;
 
 static struct k_work_delayable gravity_work;
 static struct k_work_delayable clear_work;
+static struct k_work_delayable spawn_work;
 
 /* forward */
 static void apply_pending_and_redraw_once(void);
@@ -518,29 +600,58 @@ static void start_batch(struct update_line *lines, uint8_t len) {
 }
 
 /* full frame buffer */
-static char full_frame_buf[256];
+static char full_frame_buf[512];
 
 static void build_full_frame_text(void) {
     size_t w = 0;
-    const char *hdr = "tetris zmk\nscore 0000\n\n";
+
+    const char *hdr = "tetris zmk\n";
     for (size_t i = 0; hdr[i] && w + 1 < sizeof(full_frame_buf); i++) full_frame_buf[w++] = hdr[i];
+
+    build_score_next();
+    for (size_t i = 0; score_next[i] && w + 1 < sizeof(full_frame_buf); i++) full_frame_buf[w++] = score_next[i];
+    if (w + 1 < sizeof(full_frame_buf)) full_frame_buf[w++] = '\n';
+    if (w + 1 < sizeof(full_frame_buf)) full_frame_buf[w++] = '\n';
 
     rebuild_render_next();
     for (int r = 0; r < BOARD_H; r++) {
         for (int i = 0; render_next[r][i] && w + 1 < sizeof(full_frame_buf); i++) full_frame_buf[w++] = render_next[r][i];
         if (w + 1 < sizeof(full_frame_buf)) full_frame_buf[w++] = '\n';
     }
+
     full_frame_buf[w] = '\0';
 }
 
+/* build a combined diff batch: score line + board lines */
 static void request_diff_render(void) {
-    rebuild_render_next();
-
-    struct update_line lines[MAX_UPDATE_LINES];
-    uint8_t len = make_diff_lines(lines);
-    if (len == 0) return;
     if (rs.running) return;
 
+    struct update_line lines[MAX_UPDATE_LINES];
+    uint8_t len = 0;
+
+    /* score line (line 1) */
+    build_score_next();
+    if (!score_equals() && len < MAX_UPDATE_LINES) {
+        lines[len].line_index = 1;
+        for (int i = 0; i < UPDATE_TEXT_MAX; i++) {
+            lines[len].text[i] = score_next[i];
+            if (score_next[i] == '\0') break;
+        }
+        lines[len].text[UPDATE_TEXT_MAX - 1] = '\0';
+        commit_score_line();
+        len++;
+    }
+
+    /* board diff */
+    rebuild_render_next();
+    struct update_line board_lines[MAX_UPDATE_LINES];
+    uint8_t b_len = make_board_diff(board_lines);
+
+    for (uint8_t i = 0; i < b_len && len < MAX_UPDATE_LINES; i++) {
+        lines[len++] = board_lines[i];
+    }
+
+    if (len == 0) return;
     start_batch(lines, len);
 }
 
@@ -591,6 +702,10 @@ static void render_work_handler(struct k_work *work) {
                     if (render_next[r][i] == '\0') break;
                 }
             }
+
+            /* score commit as well */
+            build_score_next();
+            commit_score_line();
 
             rs.running = false;
             rs.mode = RENDER_IDLE;
@@ -676,7 +791,8 @@ static void render_work_handler(struct k_work *work) {
         default:
             if (rs.batch_pos + 1 < rs.batch_len) {
                 rs.batch_pos++;
-                start_replace_line_script(rs.batch[rs.batch_pos].line_index, rs.batch[rs.batch_pos].text);
+                start_replace_line_script(rs.batch[rs.batch_pos].line_index,
+                                          rs.batch[rs.batch_pos].text);
                 return;
             }
 
@@ -697,7 +813,7 @@ static void render_work_handler(struct k_work *work) {
 }
 
 /* ==============================
- * Gravity / Clear scheduling
+ * Gravity / Clear / Spawn scheduling
  * ============================== */
 static void schedule_gravity_idle(void) {
     k_work_reschedule(&gravity_work, K_MSEC(idle_before_fall_ms));
@@ -711,44 +827,61 @@ static void on_user_input_common(void) {
     schedule_gravity_idle();
 }
 
+static void begin_spawn_delay(uint16_t delay_ms) {
+    has_falling = false;                 /* hide next piece during delay */
+    pending_spawn_delay_ms = delay_ms;
+    request_diff_render();               /* redraw board without piece if needed */
+    k_work_reschedule(&spawn_work, K_MSEC(delay_ms));
+}
+
 static void begin_clear_animation(uint16_t mask) {
     clearing = true;
     clear_mask = mask;
     clear_step = 0;
 
-    /* draw first effect immediately if possible */
     request_diff_render();
     k_work_reschedule(&clear_work, K_MSEC(clear_frame_ms));
 }
 
-static void on_piece_landed(void) {
-    lock_falling();
-    uint16_t mask = detect_full_lines();
-    if (mask) {
-        begin_clear_animation(mask);
-        return;
-    }
-    spawn_piece();
-    request_diff_render();
-    schedule_gravity_idle();
-}
-
 static bool do_fall_one(void) {
     int ny = falling.y + 1;
-    if (can_place(falling.type, falling.rot, falling.x, ny)) {
+    if (has_falling && can_place(falling.type, falling.rot, falling.x, ny)) {
         falling.y = ny;
         return true;
     }
     return false;
 }
 
-static void hard_drop_and_land(void) {
-    while (do_fall_one()) {
-        /* keep falling */
+static void on_piece_landed(void) {
+    /* lock current piece; hide piece immediately to avoid “next piece appears early” */
+    lock_falling();
+    has_falling = false;
+
+    uint16_t mask = detect_full_lines();
+    if (mask) {
+        /* score update at clear-start (once) */
+        uint8_t cleared = popcount16(mask);
+        lines_cleared_total = (uint16_t)(lines_cleared_total + cleared);
+
+        /* classic-ish table: 1=100,2=300,3=500,4=800 */
+        static const uint16_t tbl[5] = {0, 100, 300, 500, 800};
+        score += tbl[cleared <= 4 ? cleared : 4];
+
+        begin_clear_animation(mask);
+        return;
     }
+
+    /* no clear: delay before spawning (hard drop has bigger delay) */
+    begin_spawn_delay(last_land_was_harddrop ? post_hard_drop_delay_ms : post_land_spawn_delay_ms);
+}
+
+static void hard_drop_and_land(void) {
+    if (!has_falling) return;
+    while (do_fall_one()) { /* drop */ }
     on_piece_landed();
 }
 
+/* clear animation worker */
 static void clear_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
 
@@ -767,7 +900,7 @@ static void clear_work_handler(struct k_work *work) {
         return;
     }
 
-    /* finish: actually clear + spawn next, then draw */
+    /* finish: apply clear, then delay spawn */
     uint16_t mask = clear_mask;
 
     clearing = false;
@@ -775,16 +908,41 @@ static void clear_work_handler(struct k_work *work) {
     clear_step = 0;
 
     apply_line_clear(mask);
+
+    /* after actually cleared, wait a bit more before spawning */
+    begin_spawn_delay(post_clear_spawn_delay_ms);
+}
+
+/* spawn delay worker */
+static void spawn_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    if (clearing) {
+        k_work_reschedule(&spawn_work, K_MSEC(30));
+        return;
+    }
+    if (rs.running) {
+        k_work_reschedule(&spawn_work, K_MSEC(30));
+        return;
+    }
+
     spawn_piece();
+    has_falling = true;
 
     request_diff_render();
     schedule_gravity_idle();
 }
 
+/* gravity worker */
 static void gravity_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
 
     if (clearing) {
+        k_work_reschedule(&gravity_work, K_MSEC(50));
+        return;
+    }
+    if (!has_falling) {
+        /* in spawn delay; don't fall */
         k_work_reschedule(&gravity_work, K_MSEC(50));
         return;
     }
@@ -811,14 +969,18 @@ static void gravity_work_handler(struct k_work *work) {
     }
 
     /* landed */
+    last_land_was_harddrop = false;
     on_piece_landed();
 }
 
 /* ==============================
- * Input handling (queue while rendering / clearing)
+ * Input handling (queue while rendering / clearing / spawn-delay)
  * ============================== */
 static void apply_pending_and_redraw_once(void) {
     if (rs.running || clearing) return;
+
+    /* if we're in spawn delay (no falling), just keep inputs queued */
+    if (!has_falling) return;
 
     bool changed = false;
 
@@ -834,7 +996,7 @@ static void apply_pending_and_redraw_once(void) {
         }
     }
 
-    /* rotate: apply CCW first if queued, then CW */
+    /* rotate: CCW then CW */
     while (pending_rot_ccw > 0) {
         pending_rot_ccw--;
         if (try_rotate(-1)) changed = true;
@@ -847,8 +1009,9 @@ static void apply_pending_and_redraw_once(void) {
     /* hard drop overrides */
     if (pending_hard_drop) {
         pending_hard_drop = false;
+        last_land_was_harddrop = true;
         hard_drop_and_land();
-        return; // landing path already schedules draw
+        return;
     }
 
     /* soft drop */
@@ -859,6 +1022,7 @@ static void apply_pending_and_redraw_once(void) {
             if (do_fall_one()) {
                 changed = true;
             } else {
+                last_land_was_harddrop = false;
                 on_piece_landed();
                 return;
             }
@@ -871,7 +1035,7 @@ static void apply_pending_and_redraw_once(void) {
 
 static void on_user_dx(int dx) {
     on_user_input_common();
-    if (rs.running || clearing) { pending_dx += dx; return; }
+    if (rs.running || clearing || !has_falling) { pending_dx += dx; return; }
 
     int nx = falling.x + dx;
     if (can_place(falling.type, falling.rot, nx, falling.y)) {
@@ -882,7 +1046,7 @@ static void on_user_dx(int dx) {
 
 static void on_user_rotate(int dir) {
     on_user_input_common();
-    if (rs.running || clearing) {
+    if (rs.running || clearing || !has_falling) {
         if (dir > 0) pending_rot_cw++;
         else pending_rot_ccw++;
         return;
@@ -892,18 +1056,20 @@ static void on_user_rotate(int dir) {
 
 static void on_user_soft_drop(void) {
     on_user_input_common();
-    if (rs.running || clearing) { pending_soft_drop++; return; }
+    if (rs.running || clearing || !has_falling) { pending_soft_drop++; return; }
 
     if (do_fall_one()) {
         request_diff_render();
     } else {
+        last_land_was_harddrop = false;
         on_piece_landed();
     }
 }
 
 static void on_user_hard_drop(void) {
     on_user_input_common();
-    if (rs.running || clearing) { pending_hard_drop = true; return; }
+    if (rs.running || clearing || !has_falling) { pending_hard_drop = true; return; }
+    last_land_was_harddrop = true;
     hard_drop_and_land();
 }
 
@@ -916,6 +1082,11 @@ static void reset_game(void) {
         for (int i = 0; i < BOARD_W + 2; i++) render_prev[r][i] = '\0';
     }
 
+    /* score */
+    score = 0;
+    lines_cleared_total = 0;
+    score_prev[0] = '\0';
+
     pending_dx = 0;
     pending_rot_cw = 0;
     pending_rot_ccw = 0;
@@ -926,9 +1097,13 @@ static void reset_game(void) {
     clear_mask = 0;
     clear_step = 0;
 
+    last_land_was_harddrop = false;
+    pending_spawn_delay_ms = 0;
+
     last_input_ms = (uint32_t)k_uptime_get();
 
     spawn_piece();
+    has_falling = true;
 
     rebuild_render_next();
     for (int r = 0; r < BOARD_H; r++) for (int i = 0; i < BOARD_W + 2; i++) render_prev[r][i] = '\0';
@@ -942,9 +1117,9 @@ static void reset_game(void) {
  * 1: async clear editor
  * 10: left
  * 11: right
- * 12: rotate CW (wall-kick)
- * 13: soft drop (1 step)
- * 14: rotate CCW (wall-kick)
+ * 12: rotate CW
+ * 13: soft drop
+ * 14: rotate CCW
  * 15: hard drop
  * ============================== */
 static int on_pressed(struct zmk_behavior_binding *binding,
@@ -957,6 +1132,7 @@ static int on_pressed(struct zmk_behavior_binding *binding,
         k_work_init_delayable(&rs.work, render_work_handler);
         k_work_init_delayable(&gravity_work, gravity_work_handler);
         k_work_init_delayable(&clear_work, clear_work_handler);
+        k_work_init_delayable(&spawn_work, spawn_work_handler);
         rs.inited = true;
     }
 
@@ -967,6 +1143,7 @@ static int on_pressed(struct zmk_behavior_binding *binding,
         stop_render();
         k_work_cancel_delayable(&gravity_work);
         k_work_cancel_delayable(&clear_work);
+        k_work_cancel_delayable(&spawn_work);
 
         reset_game();
         build_full_frame_text();
@@ -979,6 +1156,7 @@ static int on_pressed(struct zmk_behavior_binding *binding,
         stop_render();
         k_work_cancel_delayable(&gravity_work);
         k_work_cancel_delayable(&clear_work);
+        k_work_cancel_delayable(&spawn_work);
 
         start_clear_editor_async(REQ_CLEAR_ONLY);
         return ZMK_BEHAVIOR_OPAQUE;

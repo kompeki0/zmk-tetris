@@ -37,7 +37,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
  * - once falling starts, fall every fall_interval_ms
  */
 static uint16_t idle_before_fall_ms = 2000;
-static uint16_t fall_interval_ms    = 700;  // 好みで 500〜1200 くらい
+static uint16_t fall_interval_ms    = 700;
 
 /* delays for editor ops (stability) */
 static uint32_t delay_for_char(char c) {
@@ -92,11 +92,6 @@ static bool char_to_keycode(char c, uint32_t *out) {
     case ')': *out = RPAR; return true;
     default: return false;
     }
-}
-
-static void clear_editor(void) {
-    tap_with_mod(LCTRL, A);
-    tap(BACKSPACE);
 }
 
 /* ==============================
@@ -175,7 +170,6 @@ static bool row_equals(const char *a, const char *b) {
 
 /* make diff list from prev->next, up to 5 lines.
  * returns len, and also “commits” prev=row_next for rows included
- * (we assume render succeeds; if you want超堅牢なら描画完了後commitでもOK)
  */
 static uint8_t make_diff_lines(struct update_line out[MAX_UPDATE_LINES]) {
     uint8_t n = 0;
@@ -184,13 +178,12 @@ static uint8_t make_diff_lines(struct update_line out[MAX_UPDATE_LINES]) {
         if (n >= MAX_UPDATE_LINES) break;
 
         out[n].line_index = BOARD_TOP_LINE_INDEX + r;
-        // copy
+
         for (int i = 0; i < BOARD_W + 2; i++) {
             out[n].text[i] = render_next[r][i];
             if (render_next[r][i] == '\0') break;
         }
 
-        // commit for next diff
         for (int i = 0; i < BOARD_W + 2; i++) {
             render_prev[r][i] = render_next[r][i];
             if (render_next[r][i] == '\0') break;
@@ -202,8 +195,24 @@ static uint8_t make_diff_lines(struct update_line out[MAX_UPDATE_LINES]) {
 }
 
 /* ==============================
- * Render engine: replace a single line, chain batch (<=5)
+ * Render engine
+ * - MODE_CLEAR: Ctrl+A -> Backspace
+ * - MODE_TYPE_FULL: type whole frame (header + board)
+ * - MODE_REPLACE_LINE: replace one line, chained as batch (<=5)
  * ============================== */
+enum render_mode {
+    RENDER_IDLE = 0,
+    RENDER_CLEAR_EDITOR,
+    RENDER_TYPE_FULL,
+    RENDER_REPLACE_LINE_SCRIPT,
+};
+
+enum clear_phase {
+    CLP_CTRL_A = 0,
+    CLP_BS,
+    CLP_DONE,
+};
+
 enum script_phase {
     SPH_CTRL_HOME = 0,
     SPH_DOWN_REPEAT,
@@ -216,11 +225,27 @@ enum script_phase {
     SPH_DONE
 };
 
+enum request_type {
+    REQ_NONE = 0,
+    REQ_CLEAR_ONLY,
+    REQ_RESET_AND_DRAW,
+};
+
 struct render_state {
     bool inited;
     bool running;
 
-    /* current line replace script */
+    enum request_type req;
+    enum render_mode mode;
+
+    /* clear editor */
+    enum clear_phase clear_phase;
+
+    /* full text typing */
+    const char *text;
+    size_t text_idx;
+
+    /* replace-line script */
     enum script_phase phase;
     int down_remaining;
     const char *line_text;
@@ -231,7 +256,6 @@ struct render_state {
     uint8_t batch_len;
     uint8_t batch_pos;
 
-    /* work */
     struct k_work_delayable work;
 };
 
@@ -240,8 +264,40 @@ static struct render_state rs;
 /* gravity */
 static struct k_work_delayable gravity_work;
 
-/* start a single line replace script (does NOT wipe batch; caller sets batch as needed) */
+/* forward */
+static void apply_pending_and_redraw_once(void);
+
+/* stop current rendering */
+static void stop_render(void) {
+    rs.running = false;
+    rs.req = REQ_NONE;
+    rs.mode = RENDER_IDLE;
+    rs.batch_len = 0;
+    rs.batch_pos = 0;
+    k_work_cancel_delayable(&rs.work);
+}
+
+/* start clear editor in worker */
+static void start_clear_editor_async(enum request_type req_after) {
+    rs.req = req_after;
+    rs.mode = RENDER_CLEAR_EDITOR;
+    rs.clear_phase = CLP_CTRL_A;
+    rs.running = true;
+    k_work_reschedule(&rs.work, K_NO_WAIT);
+}
+
+/* start full text typing in worker */
+static void start_full_text_async(const char *text) {
+    rs.mode = RENDER_TYPE_FULL;
+    rs.text = text;
+    rs.text_idx = 0;
+    rs.running = true;
+    k_work_reschedule(&rs.work, K_NO_WAIT);
+}
+
+/* start a single line replace script */
 static void start_replace_line_script(int line_index_zero_based, const char *line) {
+    rs.mode = RENDER_REPLACE_LINE_SCRIPT;
     rs.phase = SPH_CTRL_HOME;
     rs.down_remaining = line_index_zero_based;
     rs.line_text = line;
@@ -249,11 +305,6 @@ static void start_replace_line_script(int line_index_zero_based, const char *lin
 
     rs.running = true;
     k_work_reschedule(&rs.work, K_NO_WAIT);
-}
-
-static void stop_render(void) {
-    rs.running = false;
-    k_work_cancel_delayable(&rs.work);
 }
 
 /* start batch updates (len<=5) */
@@ -265,100 +316,32 @@ static void start_batch(struct update_line *lines, uint8_t len) {
     rs.batch_len = len;
     rs.batch_pos = 0;
 
-    // kick first
     start_replace_line_script(rs.batch[0].line_index, rs.batch[0].text);
 }
 
-/* after render finishes, apply queued inputs once and redraw */
-static void apply_pending_and_redraw_once(void);
+/* ==============================
+ * Full frame buffer (typed in worker on reset)
+ * ============================== */
+static char full_frame_buf[256];
 
-/* renderer worker */
-static void render_work_handler(struct k_work *work) {
-    ARG_UNUSED(work);
-    if (!rs.running) return;
-
-    switch (rs.phase) {
-    case SPH_CTRL_HOME:
-        tap_with_mod(LCTRL, HOME);
-        rs.phase = SPH_DOWN_REPEAT;
-        k_work_reschedule(&rs.work, K_MSEC(delay_nav()));
-        return;
-
-    case SPH_DOWN_REPEAT:
-        if (rs.down_remaining > 0) {
-            tap(DOWN);
-            rs.down_remaining--;
-            k_work_reschedule(&rs.work, K_MSEC(delay_nav()));
-            return;
-        }
-        rs.phase = SPH_HOME;
-        k_work_reschedule(&rs.work, K_MSEC(delay_nav()));
-        return;
-
-    case SPH_HOME:
-        tap(HOME);
-        rs.phase = SPH_SHIFT_END_PRESS;
-        k_work_reschedule(&rs.work, K_MSEC(delay_action()));
-        return;
-
-    case SPH_SHIFT_END_PRESS:
-        press(LSHIFT);
-        rs.phase = SPH_END_TAP;
-        k_work_reschedule(&rs.work, K_MSEC(4));
-        return;
-
-    case SPH_END_TAP:
-        tap(END);
-        rs.phase = SPH_SHIFT_END_RELEASE;
-        k_work_reschedule(&rs.work, K_MSEC(4));
-        return;
-
-    case SPH_SHIFT_END_RELEASE:
-        release(LSHIFT);
-        rs.phase = SPH_BACKSPACE;
-        k_work_reschedule(&rs.work, K_MSEC(delay_action()));
-        return;
-
-    case SPH_BACKSPACE:
-        tap(BACKSPACE);
-        rs.phase = SPH_TYPE_LINE;
-        rs.line_idx = 0;
-        k_work_reschedule(&rs.work, K_MSEC(delay_action()));
-        return;
-
-    case SPH_TYPE_LINE: {
-        char c = rs.line_text[rs.line_idx];
-        if (c == '\0') {
-            rs.phase = SPH_DONE;
-            k_work_reschedule(&rs.work, K_MSEC(delay_action()));
-            return;
-        }
-        uint32_t kc;
-        if (char_to_keycode(c, &kc)) tap(kc);
-        rs.line_idx++;
-        k_work_reschedule(&rs.work, K_MSEC(delay_for_char(c)));
-        return;
+static void build_full_frame_text(void) {
+    /* header */
+    size_t w = 0;
+    const char *hdr = "tetris (zmk)\nscore 0000\n\n";
+    for (size_t i = 0; hdr[i] && w + 1 < sizeof(full_frame_buf); i++) {
+        full_frame_buf[w++] = hdr[i];
     }
 
-    case SPH_DONE:
-    default:
-        /* batch chaining */
-        if (rs.batch_pos + 1 < rs.batch_len) {
-            rs.batch_pos++;
-            start_replace_line_script(rs.batch[rs.batch_pos].line_index,
-                                      rs.batch[rs.batch_pos].text);
-            return;
+    /* board */
+    rebuild_render_next();
+    for (int r = 0; r < BOARD_H; r++) {
+        for (int i = 0; render_next[r][i] && w + 1 < sizeof(full_frame_buf); i++) {
+            full_frame_buf[w++] = render_next[r][i];
         }
-
-        /* batch finished */
-        rs.running = false;
-        rs.batch_len = 0;
-        rs.batch_pos = 0;
-
-        /* after any render completes, apply queued inputs once */
-        apply_pending_and_redraw_once();
-        return;
+        if (w + 1 < sizeof(full_frame_buf)) full_frame_buf[w++] = '\n';
     }
+
+    full_frame_buf[w] = '\0';
 }
 
 /* ==============================
@@ -372,42 +355,179 @@ static void request_diff_render(void) {
 
     if (len == 0) return;
 
-    // If something is already rendering, we do nothing here.
-    // Callers ensure this is used only when rs.running==false,
-    // or they queue inputs instead.
+    /* only start if not already running */
+    if (rs.running) return;
+
     start_batch(lines, len);
 }
 
-/* full redraw helper (debug / recovery) */
-static void request_full_redraw(void) {
-    stop_render();
-    clear_editor();
+/* renderer worker */
+static void render_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
 
-    // header
-    const char *title = "tetris (zmk)\nscore 0000\n\n";
-    for (size_t i = 0; title[i]; i++) {
+    if (!rs.running) return;
+
+    /* ---------- CLEAR EDITOR MODE ---------- */
+    if (rs.mode == RENDER_CLEAR_EDITOR) {
+        switch (rs.clear_phase) {
+        case CLP_CTRL_A:
+            tap_with_mod(LCTRL, A);
+            rs.clear_phase = CLP_BS;
+            k_work_reschedule(&rs.work, K_MSEC(delay_action()));
+            return;
+
+        case CLP_BS:
+            tap(BACKSPACE);
+            rs.clear_phase = CLP_DONE;
+            k_work_reschedule(&rs.work, K_MSEC(delay_action()));
+            return;
+
+        case CLP_DONE:
+        default: {
+            enum request_type next = rs.req;
+            rs.req = REQ_NONE;
+
+            /* after clear, chain requested action */
+            if (next == REQ_RESET_AND_DRAW) {
+                start_full_text_async(full_frame_buf);
+                return;
+            }
+
+            /* CLEAR only done */
+            rs.running = false;
+            rs.mode = RENDER_IDLE;
+            rs.batch_len = 0;
+            rs.batch_pos = 0;
+
+            apply_pending_and_redraw_once();
+            return;
+        }
+        }
+    }
+
+    /* ---------- FULL TEXT TYPE MODE ---------- */
+    if (rs.mode == RENDER_TYPE_FULL) {
+        char c = rs.text[rs.text_idx];
+        if (c == '\0') {
+            /* full draw finished: commit render_prev = render_next (current) */
+            rebuild_render_next();
+            for (int r = 0; r < BOARD_H; r++) {
+                for (int i = 0; i < BOARD_W + 2; i++) {
+                    render_prev[r][i] = render_next[r][i];
+                    if (render_next[r][i] == '\0') break;
+                }
+            }
+
+            rs.running = false;
+            rs.mode = RENDER_IDLE;
+            rs.batch_len = 0;
+            rs.batch_pos = 0;
+
+            apply_pending_and_redraw_once();
+            return;
+        }
+
         uint32_t kc;
-        if (char_to_keycode(title[i], &kc)) tap(kc);
-        k_msleep(delay_for_char(title[i]));
+        if (char_to_keycode(c, &kc)) {
+            tap(kc);
+        }
+        rs.text_idx++;
+
+        k_work_reschedule(&rs.work, K_MSEC(delay_for_char(c)));
+        return;
     }
 
-    // board lines
-    rebuild_render_next();
-    for (int r = 0; r < BOARD_H; r++) {
-        for (int i = 0; render_next[r][i]; i++) {
+    /* ---------- REPLACE LINE SCRIPT MODE ---------- */
+    if (rs.mode == RENDER_REPLACE_LINE_SCRIPT) {
+        switch (rs.phase) {
+        case SPH_CTRL_HOME:
+            tap_with_mod(LCTRL, HOME);
+            rs.phase = SPH_DOWN_REPEAT;
+            k_work_reschedule(&rs.work, K_MSEC(delay_nav()));
+            return;
+
+        case SPH_DOWN_REPEAT:
+            if (rs.down_remaining > 0) {
+                tap(DOWN);
+                rs.down_remaining--;
+                k_work_reschedule(&rs.work, K_MSEC(delay_nav()));
+                return;
+            }
+            rs.phase = SPH_HOME;
+            k_work_reschedule(&rs.work, K_MSEC(delay_nav()));
+            return;
+
+        case SPH_HOME:
+            tap(HOME);
+            rs.phase = SPH_SHIFT_END_PRESS;
+            k_work_reschedule(&rs.work, K_MSEC(delay_action()));
+            return;
+
+        case SPH_SHIFT_END_PRESS:
+            press(LSHIFT);
+            rs.phase = SPH_END_TAP;
+            k_work_reschedule(&rs.work, K_MSEC(4));
+            return;
+
+        case SPH_END_TAP:
+            tap(END);
+            rs.phase = SPH_SHIFT_END_RELEASE;
+            k_work_reschedule(&rs.work, K_MSEC(4));
+            return;
+
+        case SPH_SHIFT_END_RELEASE:
+            release(LSHIFT);
+            rs.phase = SPH_BACKSPACE;
+            k_work_reschedule(&rs.work, K_MSEC(delay_action()));
+            return;
+
+        case SPH_BACKSPACE:
+            tap(BACKSPACE);
+            rs.phase = SPH_TYPE_LINE;
+            rs.line_idx = 0;
+            k_work_reschedule(&rs.work, K_MSEC(delay_action()));
+            return;
+
+        case SPH_TYPE_LINE: {
+            char c = rs.line_text[rs.line_idx];
+            if (c == '\0') {
+                rs.phase = SPH_DONE;
+                k_work_reschedule(&rs.work, K_MSEC(delay_action()));
+                return;
+            }
             uint32_t kc;
-            if (char_to_keycode(render_next[r][i], &kc)) tap(kc);
-            k_msleep(delay_for_char(render_next[r][i]));
+            if (char_to_keycode(c, &kc)) tap(kc);
+            rs.line_idx++;
+            k_work_reschedule(&rs.work, K_MSEC(delay_for_char(c)));
+            return;
         }
-        tap(ENTER);
-        k_msleep(delay_for_char('\n'));
 
-        // commit
-        for (int i = 0; i < BOARD_W + 2; i++) {
-            render_prev[r][i] = render_next[r][i];
-            if (render_next[r][i] == '\0') break;
+        case SPH_DONE:
+        default:
+            /* batch chaining */
+            if (rs.batch_pos + 1 < rs.batch_len) {
+                rs.batch_pos++;
+                start_replace_line_script(rs.batch[rs.batch_pos].line_index,
+                                          rs.batch[rs.batch_pos].text);
+                return;
+            }
+
+            /* batch finished */
+            rs.running = false;
+            rs.mode = RENDER_IDLE;
+            rs.batch_len = 0;
+            rs.batch_pos = 0;
+
+            apply_pending_and_redraw_once();
+            return;
         }
     }
+
+    /* fallback */
+    rs.running = false;
+    rs.mode = RENDER_IDLE;
+    rs.batch_len = 0;
+    rs.batch_pos = 0;
 }
 
 /* ==============================
@@ -425,6 +545,7 @@ static void on_user_input_common(void) {
     schedule_gravity_idle(); // always postpone fall until idle
 }
 
+/* after render finishes, apply queued inputs once and redraw */
 static void apply_pending_and_redraw_once(void) {
     if (pending_dx == 0) return;
     if (rs.running) return;
@@ -433,8 +554,8 @@ static void apply_pending_and_redraw_once(void) {
     pending_dx = 0;
 
     int new_x = piece_x + dx;
-    clamp_piece(); // for current first
-    // apply with collision
+
+    /* apply with collision */
     if (can_place_o(new_x, piece_y)) {
         piece_x = new_x;
         clamp_piece();
@@ -485,7 +606,7 @@ static void gravity_work_handler(struct k_work *work) {
         return;
     }
 
-    /* if rendering, retry shortly (inputs will queue) */
+    /* if rendering, retry shortly */
     if (rs.running) {
         k_work_reschedule(&gravity_work, K_MSEC(30));
         return;
@@ -494,14 +615,11 @@ static void gravity_work_handler(struct k_work *work) {
     /* fall first, then render */
     if (do_fall_one()) {
         request_diff_render();
-        // continue falling at interval (but user input will postpone again)
         schedule_gravity_interval();
         return;
     }
 
-    /* reached bottom (future: lock & spawn)
-     * For now, just stop.
-     */
+    /* reached bottom (future: lock & spawn) */
 }
 
 /* ==============================
@@ -512,7 +630,6 @@ static void reset_game(void) {
         for (int c = 0; c < BOARD_W; c++) {
             board_locked[r][c] = 0;
         }
-        // render_prev init to something impossible so first diff updates all
         for (int i = 0; i < BOARD_W + 2; i++) render_prev[r][i] = '\0';
     }
 
@@ -535,8 +652,8 @@ static void reset_game(void) {
  * Behavior entry
  *
  * Commands:
- * 0: reset + full redraw + start gravity (idle)
- * 1: clear editor
+ * 0: reset + async clear + async draw + start gravity (idle)
+ * 1: async clear editor
  * 10: left
  * 11: right
  * ============================== */
@@ -555,22 +672,22 @@ static int on_pressed(struct zmk_behavior_binding *binding,
     LOG_DBG("tetris cmd=%d", cmd);
 
     switch (cmd) {
-    case 0: /* RESET + FULL REDRAW */
-        tap(A);
-        return ZMK_BEHAVIOR_OPAQUE;
+    case 0: /* RESET + ASYNC DRAW */
         stop_render();
         k_work_cancel_delayable(&gravity_work);
+
         reset_game();
-        request_full_redraw();
+        build_full_frame_text();              /* build full_frame_buf from current state */
+        start_clear_editor_async(REQ_RESET_AND_DRAW); /* clear -> full draw in worker */
+
         schedule_gravity_idle();
         return ZMK_BEHAVIOR_OPAQUE;
 
-    case 1: /* CLEAR */
-        tap(B);
-        return ZMK_BEHAVIOR_OPAQUE;
+    case 1: /* CLEAR (ASYNC) */
         stop_render();
         k_work_cancel_delayable(&gravity_work);
-        clear_editor();
+
+        start_clear_editor_async(REQ_CLEAR_ONLY);
         return ZMK_BEHAVIOR_OPAQUE;
 
     case 10: /* LEFT */

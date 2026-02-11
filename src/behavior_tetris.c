@@ -153,6 +153,7 @@ struct piece_state {
 
 static struct piece_state falling;
 static bool has_falling; /* false during spawn-delay to avoid showing next piece */
+static bool paused;
 
 /* score */
 static uint32_t score;
@@ -272,22 +273,22 @@ static const uint16_t SHAPE[TET_COUNT][4] = {
     /* J (fixed) */
     {
         /* rot 0: JJJ / J..  */
-        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,1),
+        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,3),
         /* rot 1: .J. / .J. / JJ.  (出っ張りが左下) */
         BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(2,1),
         /* rot 2: ..J / JJJ */
-        BIT_AT(0,3) | BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3),
+        BIT_AT(0,1) | BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3),
         /* rot 3: .JJ / .J. / .J.  (出っ張りが右上) */
         BIT_AT(0,2) | BIT_AT(0,3) | BIT_AT(1,2) | BIT_AT(2,2),
     },
     /* L (fixed) */
     {
         /* rot 0: LLL / ..L */
-        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,3),
+        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,1),
         /* rot 1: .L. / .L. / .LL  (出っ張りが右下) */
         BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(2,3),
         /* rot 2: L.. / LLL */
-        BIT_AT(0,1) | BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3),
+        BIT_AT(0,3) | BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3),
         /* rot 3: LL. / .L. / .L.  (出っ張りが左上) */
         BIT_AT(0,1) | BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2),
     },
@@ -729,6 +730,17 @@ static void build_full_frame_text(void) {
     full_frame_buf[w] = '\0';
 }
 
+static void force_redraw_all(void) {
+    /* render_prevを全消しして差分を“全行”にする */
+    for (int r = 0; r < BOARD_H; r++) {
+        for (int i = 0; i < BOARD_W + 2; i++) render_prev[r][i] = '\0';
+    }
+    score_prev[0] = '\0'; /* scoreも必ず更新させる */
+
+    request_diff_render();
+}
+
+
 /* build a combined diff batch: score line + board lines */
 static void request_diff_render(void) {
     if (rs.running) return;
@@ -988,7 +1000,10 @@ static void hard_drop_and_land(void) {
 /* clear animation worker */
 static void clear_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
-
+    if (paused) {
+        k_work_reschedule(&clear_work, K_MSEC(100));
+        return;
+    }
     if (!clearing) return;
 
     if (rs.running) {
@@ -1019,6 +1034,10 @@ static void clear_work_handler(struct k_work *work) {
 static void spawn_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
 
+    if (paused) {
+        k_work_reschedule(&spawn_work, K_MSEC(100));
+        return;
+    }
     if (clearing) {
         k_work_reschedule(&spawn_work, K_MSEC(30));
         return;
@@ -1038,7 +1057,11 @@ static void spawn_work_handler(struct k_work *work) {
 /* gravity worker */
 static void gravity_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
-
+    if (paused) {
+        /* paused: do nothing, keep stopped */
+        k_work_reschedule(&gravity_work, K_MSEC(100));
+        return;
+    }
     if (clearing) {
         k_work_reschedule(&gravity_work, K_MSEC(50));
         return;
@@ -1140,6 +1163,7 @@ static void apply_pending_and_redraw_once(void) {
 }
 
 static void on_user_dx(int dx) {
+    if (paused) return;
     on_user_input_common();
     if (rs.running || clearing || !has_falling) { pending_dx += dx; return; }
 
@@ -1190,6 +1214,7 @@ static void on_user_hold(void) {
  * Init/reset
  * ============================== */
 static void reset_game(void) {
+    paused = false;
     for (int r = 0; r < BOARD_H; r++) {
         for (int c = 0; c < BOARD_W; c++) board_locked[r][c] = 0;
         for (int i = 0; i < BOARD_W + 2; i++) render_prev[r][i] = '\0';
@@ -1236,6 +1261,8 @@ static void reset_game(void) {
  * Commands:
  * 0: reset + async clear + async draw + start gravity (idle)
  * 1: async clear editor
+ * 2: pause toggle
+ * 3: redraw (score+board) without clearing editor
  * 10: left
  * 11: right
  * 12: rotate CW
@@ -1282,7 +1309,23 @@ static int on_pressed(struct zmk_behavior_binding *binding,
 
         start_clear_editor_async(REQ_CLEAR_ONLY);
         return ZMK_BEHAVIOR_OPAQUE;
+    
+    case 2: /* pause toggle */
+        paused = !paused;
+        if (paused) {
+            /* stop game progression immediately */
+            k_work_cancel_delayable(&gravity_work);
+        } else {
+            /* resume */
+            schedule_gravity_idle();
+        }
+        /* 表示を変えないなら不要だが、状態ズレ対策で再描画はしておくと安心 */
+        force_redraw_all();
+        return ZMK_BEHAVIOR_OPAQUE;
 
+    case 3: /* redraw */
+        force_redraw_all();
+        return ZMK_BEHAVIOR_OPAQUE;
     case 10:
         on_user_dx(-1);
         return ZMK_BEHAVIOR_OPAQUE;

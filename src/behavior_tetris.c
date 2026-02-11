@@ -6,12 +6,9 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/random/random.h>
-
 #include <drivers/behavior.h>
-
 #include <zmk/behavior.h>
 #include <zmk/events/keycode_state_changed.h>
-
 #include <dt-bindings/zmk/keys.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -30,21 +27,18 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
  */
 #define BOARD_TOP_LINE_INDEX 3
 
-/* You said "10 is fine" */
 #define MAX_UPDATE_LINES 10
 
-/* gravity:
- * - wait idle_before_fall_ms after last user input before falling
- * - once falling starts, fall every fall_interval_ms
- */
+/* gravity */
 static uint16_t idle_before_fall_ms = 2000;
 static uint16_t fall_interval_ms    = 700;
 
+/* clear effect */
+static uint8_t  clear_frames   = 4;   // 点滅回数
+static uint16_t clear_frame_ms = 110; // 点滅間隔
+
 /* delays for editor ops (stability) */
-static uint32_t delay_for_char(char c) {
-    if (c == '\n') return 25;
-    return 6;
-}
+static uint32_t delay_for_char(char c) { return (c == '\n') ? 25 : 6; }
 static uint32_t delay_nav(void) { return 12; }
 static uint32_t delay_action(void) { return 18; }
 
@@ -71,8 +65,7 @@ static inline void tap_with_mod(uint32_t mod, uint32_t key) {
 }
 
 /* ==============================
- * Text typing (safe subset)
- *  - ここは崩れにくい文字だけ推奨
+ * Text typing
  * ============================== */
 static bool char_to_keycode(char c, uint32_t *out) {
     switch (c) {
@@ -80,6 +73,10 @@ static bool char_to_keycode(char c, uint32_t *out) {
     case '.': *out = DOT; return true;
     case ' ': *out = SPACE; return true;
     case '\n': *out = ENTER; return true;
+
+    case '=': *out = EQUAL; return true;
+    case '-': *out = MINUS; return true;
+
     case '0': *out = N0; return true;
     case '1': *out = N1; return true;
     case '2': *out = N2; return true;
@@ -90,13 +87,39 @@ static bool char_to_keycode(char c, uint32_t *out) {
     case '7': *out = N7; return true;
     case '8': *out = N8; return true;
     case '9': *out = N9; return true;
-    /* NOTE: 括弧は配列差で化けやすいので一旦封印
-    case '(': *out = LPAR; return true;
-    case ')': *out = RPAR; return true;
-    */
+
+    /* lowercase letters */
+    case 'a': *out = A; return true;
+    case 'b': *out = B; return true;
+    case 'c': *out = C; return true;
+    case 'd': *out = D; return true;
+    case 'e': *out = E; return true;
+    case 'f': *out = F; return true;
+    case 'g': *out = G; return true;
+    case 'h': *out = H; return true;
+    case 'i': *out = I; return true;
+    case 'j': *out = J; return true;
+    case 'k': *out = K; return true;
+    case 'l': *out = L; return true;
+    case 'm': *out = M; return true;
+    case 'n': *out = N; return true;
+    case 'o': *out = O; return true;
+    case 'p': *out = P; return true;
+    case 'q': *out = Q; return true;
+    case 'r': *out = R; return true;
+    case 's': *out = S; return true;
+    case 't': *out = T; return true;
+    case 'u': *out = U; return true;
+    case 'v': *out = V; return true;
+    case 'w': *out = W; return true;
+    case 'y': *out = Y; return true;
+    case 'z': *out = Z; return true;
+
     default: return false;
     }
 }
+
+static void clear_editor_async_start(void); /* forward */
 
 /* ==============================
  * Game state (locked board + falling piece)
@@ -123,35 +146,31 @@ struct piece_state {
 
 static struct piece_state falling;
 
-/* queued inputs while rendering / falling animation */
+/* queued inputs while rendering / clear animation */
 static int pending_dx;
 static int pending_rot_cw;
+static int pending_rot_ccw;
+static bool pending_hard_drop;
 static int pending_soft_drop;
 static uint32_t last_input_ms;
 
+/* line clear state */
+static bool clearing;
+static uint16_t clear_mask;   // row bits
+static uint8_t clear_step;
+
 /* ==============================
  * 4x4 masks (bit 0 = (0,0), bit 15 = (3,3))
- * SRS-like orientations (CW)
  * ============================== */
 #define BIT_AT(r, c) ((uint16_t)(1u << (((r) * 4) + (c))))
-
-/* Helper to read bit from mask */
 static inline bool mask_has(uint16_t m, int r, int c) { return (m & BIT_AT(r, c)) != 0; }
 
-/*
- * Masks are defined within 4x4.
- * This set is "SRS-ish" and works with the kick tables below.
- */
 static const uint16_t SHAPE[TET_COUNT][4] = {
     /* I */
     {
-        /* rot 0 */
         BIT_AT(1,0) | BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3),
-        /* rot 1 */
         BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(3,2),
-        /* rot 2 */
         BIT_AT(2,0) | BIT_AT(2,1) | BIT_AT(2,2) | BIT_AT(2,3),
-        /* rot 3 */
         BIT_AT(0,1) | BIT_AT(1,1) | BIT_AT(2,1) | BIT_AT(3,1),
     },
     /* O */
@@ -218,45 +237,47 @@ static bool can_place(uint8_t type, uint8_t rot, int x, int y) {
 }
 
 /* ==============================
- * Wall kick (SRS-like)
- *  - We implement CW kicks only for now (enough for demo)
- *  - For O: no kick needed (it’s symmetric)
+ * Wall kick (SRS-like) CW + CCW
  * ============================== */
-
-/* JLSTZ & T (same kick table) : CW from rot -> rot+1 */
 static const int8_t KICK_JLSTZ_CW[4][5][2] = {
-    /* 0->1 */ {{0,0},{-1,0},{-1,1},{0,-2},{-1,-2}},
-    /* 1->2 */ {{0,0},{ 1,0},{ 1,-1},{0,2},{ 1,2}},
-    /* 2->3 */ {{0,0},{ 1,0},{ 1,1},{0,-2},{ 1,-2}},
-    /* 3->0 */ {{0,0},{-1,0},{-1,-1},{0,2},{-1,2}},
+    {{0,0},{-1,0},{-1,1},{0,-2},{-1,-2}}, // 0->1
+    {{0,0},{ 1,0},{ 1,-1},{0,2},{ 1,2}},  // 1->2
+    {{0,0},{ 1,0},{ 1,1},{0,-2},{ 1,-2}}, // 2->3
+    {{0,0},{-1,0},{-1,-1},{0,2},{-1,2}},  // 3->0
+};
+static const int8_t KICK_JLSTZ_CCW[4][5][2] = {
+    /* 0->3 */ {{0,0},{ 1,0},{ 1,1},{0,-2},{ 1,-2}},
+    /* 1->0 */ {{0,0},{ 1,0},{ 1,-1},{0,2},{ 1,2}},
+    /* 2->1 */ {{0,0},{-1,0},{-1,1},{0,-2},{-1,-2}},
+    /* 3->2 */ {{0,0},{-1,0},{-1,-1},{0,2},{-1,2}},
 };
 
-/* I piece CW kicks */
 static const int8_t KICK_I_CW[4][5][2] = {
-    /* 0->1 */ {{0,0},{-2,0},{ 1,0},{-2,-1},{ 1,2}},
-    /* 1->2 */ {{0,0},{-1,0},{ 2,0},{-1,2},{ 2,-1}},
-    /* 2->3 */ {{0,0},{ 2,0},{-1,0},{ 2,1},{-1,-2}},
-    /* 3->0 */ {{0,0},{ 1,0},{-2,0},{ 1,-2},{-2,1}},
+    {{0,0},{-2,0},{ 1,0},{-2,-1},{ 1,2}}, // 0->1
+    {{0,0},{-1,0},{ 2,0},{-1,2},{ 2,-1}}, // 1->2
+    {{0,0},{ 2,0},{-1,0},{ 2,1},{-1,-2}}, // 2->3
+    {{0,0},{ 1,0},{-2,0},{ 1,-2},{-2,1}}, // 3->0
+};
+static const int8_t KICK_I_CCW[4][5][2] = {
+    /* 0->3 */ {{0,0},{-1,0},{ 2,0},{-1,2},{ 2,-1}},
+    /* 1->0 */ {{0,0},{ 2,0},{-1,0},{ 2,1},{-1,-2}},
+    /* 2->1 */ {{0,0},{ 1,0},{-2,0},{ 1,-2},{-2,1}},
+    /* 3->2 */ {{0,0},{-2,0},{ 1,0},{-2,-1},{ 1,2}},
 };
 
-static bool try_rotate_cw_with_kick(void) {
+static bool try_rotate(int dir /* +1 CW, -1 CCW */) {
     uint8_t type = falling.type;
+    uint8_t r0 = falling.rot & 3;
+    uint8_t r1 = (dir > 0) ? ((r0 + 1) & 3) : ((r0 + 3) & 3);
+
     if (type == TET_O) {
-        /* O is symmetric: just rotate index and accept if placeable */
-        uint8_t nr = (falling.rot + 1) & 3;
-        if (can_place(type, nr, falling.x, falling.y)) {
-            falling.rot = nr;
-            return true;
-        }
+        if (can_place(type, r1, falling.x, falling.y)) { falling.rot = r1; return true; }
         return false;
     }
 
-    uint8_t r0 = falling.rot & 3;
-    uint8_t r1 = (r0 + 1) & 3;
-
     const int8_t (*kicks)[2] = NULL;
-    if (type == TET_I) kicks = KICK_I_CW[r0];
-    else kicks = KICK_JLSTZ_CW[r0];
+    if (type == TET_I) kicks = (dir > 0) ? KICK_I_CW[r0] : KICK_I_CCW[r0];
+    else kicks = (dir > 0) ? KICK_JLSTZ_CW[r0] : KICK_JLSTZ_CCW[r0];
 
     for (int i = 0; i < 5; i++) {
         int nx = falling.x + kicks[i][0];
@@ -268,7 +289,6 @@ static bool try_rotate_cw_with_kick(void) {
             return true;
         }
     }
-
     return false;
 }
 
@@ -282,38 +302,39 @@ static void lock_falling(void) {
             if (!mask_has(m, r, c)) continue;
             int br = falling.y + r;
             int bc = falling.x + c;
-            if (br >= 0 && br < BOARD_H && bc >= 0 && bc < BOARD_W) {
-                board_locked[br][bc] = 1;
-            }
+            if (br >= 0 && br < BOARD_H && bc >= 0 && bc < BOARD_W) board_locked[br][bc] = 1;
         }
     }
 }
 
-static void clear_lines(void) {
-    for (int r = BOARD_H - 1; r >= 0; r--) {
+static uint16_t detect_full_lines(void) {
+    uint16_t mask = 0;
+    for (int r = 0; r < BOARD_H; r++) {
         bool full = true;
         for (int c = 0; c < BOARD_W; c++) {
             if (!board_locked[r][c]) { full = false; break; }
         }
-        if (!full) continue;
-
-        /* pull down */
-        for (int rr = r; rr > 0; rr--) {
-            for (int c = 0; c < BOARD_W; c++) {
-                board_locked[rr][c] = board_locked[rr - 1][c];
-            }
-        }
-        for (int c = 0; c < BOARD_W; c++) board_locked[0][c] = 0;
-
-        /* re-check same row after collapsing */
-        r++;
+        if (full) mask |= (1u << r);
     }
+    return mask;
+}
+
+static void apply_line_clear(uint16_t mask) {
+    if (!mask) return;
+
+    int dst = BOARD_H - 1;
+    for (int src = BOARD_H - 1; src >= 0; src--) {
+        if (mask & (1u << src)) continue;
+        if (dst != src) {
+            for (int c = 0; c < BOARD_W; c++) board_locked[dst][c] = board_locked[src][c];
+        }
+        dst--;
+    }
+    for (int r = dst; r >= 0; r--) for (int c = 0; c < BOARD_W; c++) board_locked[r][c] = 0;
 }
 
 static uint8_t next_piece_counter;
-
 static uint8_t rand_piece_type(void) {
-    /* sys_rand32_get is available in Zephyr; fallback to counter if needed */
     uint32_t v = sys_rand32_get();
     uint8_t t = (uint8_t)(v % TET_COUNT);
     if (t >= TET_COUNT) t = (next_piece_counter++) % TET_COUNT;
@@ -323,62 +344,48 @@ static uint8_t rand_piece_type(void) {
 static void spawn_piece(void) {
     falling.type = rand_piece_type();
     falling.rot  = 0;
-
-    /* spawn x centered-ish */
     falling.x = 3;
     falling.y = 0;
 
-    /* If spawn collides, just reset board for demo (game over later) */
     if (!can_place(falling.type, falling.rot, falling.x, falling.y)) {
-        for (int r = 0; r < BOARD_H; r++)
-            for (int c = 0; c < BOARD_W; c++)
-                board_locked[r][c] = 0;
-        falling.x = 3; falling.y = 0; falling.rot = 0;
+        for (int r = 0; r < BOARD_H; r++) for (int c = 0; c < BOARD_W; c++) board_locked[r][c] = 0;
+        falling.type = TET_O; falling.rot = 0; falling.x = 3; falling.y = 0;
     }
-}
-
-/* one-step fall:
- * return true if moved, false if blocked -> lock+clear+spawn
- */
-static bool do_fall_one_and_handle_lock(void) {
-    int ny = falling.y + 1;
-    if (can_place(falling.type, falling.rot, falling.x, ny)) {
-        falling.y = ny;
-        return true;
-    }
-
-    /* lock */
-    lock_falling();
-    clear_lines();
-    spawn_piece();
-    return false;
 }
 
 /* ==============================
  * Renderer: prev/next board lines (locked + falling overlay)
  * ============================== */
 struct update_line {
-    int line_index;                 // absolute editor line index
-    char text[BOARD_W + 2];         // ".......... " + '\0'
+    int line_index;
+    char text[BOARD_W + 2];   // ".......... " + '\0'
 };
 
 static char render_prev[BOARD_H][BOARD_W + 2];
 static char render_next[BOARD_H][BOARD_W + 2];
 
 static void build_row_string(int row, char out[BOARD_W + 2]) {
-    for (int c = 0; c < BOARD_W; c++) {
-        out[c] = board_locked[row][c] ? 'x' : '.';
+    /* clear effect overrides (no next piece during clearing) */
+    if (clearing && (clear_mask & (1u << row))) {
+        bool on = ((clear_step % 2) == 0);
+        for (int c = 0; c < BOARD_W; c++) out[c] = on ? '=' : '.';
+        out[BOARD_W] = ' ';
+        out[BOARD_W + 1] = '\0';
+        return;
     }
 
-    /* overlay falling */
-    uint16_t m = SHAPE[falling.type][falling.rot & 3];
-    for (int r = 0; r < 4; r++) {
-        int br = falling.y + r;
-        if (br != row) continue;
-        for (int c = 0; c < 4; c++) {
-            if (!mask_has(m, r, c)) continue;
-            int bc = falling.x + c;
-            if (bc >= 0 && bc < BOARD_W) out[bc] = 'x';
+    for (int c = 0; c < BOARD_W; c++) out[c] = board_locked[row][c] ? 'x' : '.';
+
+    if (!clearing) {
+        uint16_t m = SHAPE[falling.type][falling.rot & 3];
+        for (int r = 0; r < 4; r++) {
+            int br = falling.y + r;
+            if (br != row) continue;
+            for (int c = 0; c < 4; c++) {
+                if (!mask_has(m, r, c)) continue;
+                int bc = falling.x + c;
+                if (bc >= 0 && bc < BOARD_W) out[bc] = 'x';
+            }
         }
     }
 
@@ -387,9 +394,7 @@ static void build_row_string(int row, char out[BOARD_W + 2]) {
 }
 
 static void rebuild_render_next(void) {
-    for (int r = 0; r < BOARD_H; r++) {
-        build_row_string(r, render_next[r]);
-    }
+    for (int r = 0; r < BOARD_H; r++) build_row_string(r, render_next[r]);
 }
 
 static bool row_equals(const char *a, const char *b) {
@@ -407,7 +412,6 @@ static uint8_t make_diff_lines(struct update_line out[MAX_UPDATE_LINES]) {
         if (n >= MAX_UPDATE_LINES) break;
 
         out[n].line_index = BOARD_TOP_LINE_INDEX + r;
-
         for (int i = 0; i < BOARD_W + 2; i++) {
             out[n].text[i] = render_next[r][i];
             if (render_next[r][i] == '\0') break;
@@ -418,7 +422,6 @@ static uint8_t make_diff_lines(struct update_line out[MAX_UPDATE_LINES]) {
             render_prev[r][i] = render_next[r][i];
             if (render_next[r][i] == '\0') break;
         }
-
         n++;
     }
     return n;
@@ -427,26 +430,12 @@ static uint8_t make_diff_lines(struct update_line out[MAX_UPDATE_LINES]) {
 /* ==============================
  * Render engine (async)
  * ============================== */
-enum render_mode {
-    RENDER_IDLE = 0,
-    RENDER_CLEAR_EDITOR,
-    RENDER_TYPE_FULL,
-    RENDER_REPLACE_LINE_SCRIPT,
-};
-
+enum render_mode { RENDER_IDLE = 0, RENDER_CLEAR_EDITOR, RENDER_TYPE_FULL, RENDER_REPLACE_LINE_SCRIPT };
 enum clear_phase { CLP_CTRL_A = 0, CLP_BS, CLP_DONE };
 enum script_phase {
-    SPH_CTRL_HOME = 0,
-    SPH_DOWN_REPEAT,
-    SPH_HOME,
-    SPH_SHIFT_END_PRESS,
-    SPH_END_TAP,
-    SPH_SHIFT_END_RELEASE,
-    SPH_BACKSPACE,
-    SPH_TYPE_LINE,
-    SPH_DONE
+    SPH_CTRL_HOME = 0, SPH_DOWN_REPEAT, SPH_HOME, SPH_SHIFT_END_PRESS, SPH_END_TAP,
+    SPH_SHIFT_END_RELEASE, SPH_BACKSPACE, SPH_TYPE_LINE, SPH_DONE
 };
-
 enum request_type { REQ_NONE = 0, REQ_CLEAR_ONLY, REQ_RESET_AND_DRAW };
 
 struct render_state {
@@ -474,7 +463,9 @@ struct render_state {
 };
 
 static struct render_state rs;
+
 static struct k_work_delayable gravity_work;
+static struct k_work_delayable clear_work;
 
 /* forward */
 static void apply_pending_and_redraw_once(void);
@@ -526,25 +517,19 @@ static void start_batch(struct update_line *lines, uint8_t len) {
     start_replace_line_script(rs.batch[0].line_index, rs.batch[0].text);
 }
 
-/* full frame buffer (typed on reset) */
+/* full frame buffer */
 static char full_frame_buf[256];
 
 static void build_full_frame_text(void) {
     size_t w = 0;
-    /* 括弧をやめて文字化け回避 */
     const char *hdr = "tetris zmk\nscore 0000\n\n";
-    for (size_t i = 0; hdr[i] && w + 1 < sizeof(full_frame_buf); i++) {
-        full_frame_buf[w++] = hdr[i];
-    }
+    for (size_t i = 0; hdr[i] && w + 1 < sizeof(full_frame_buf); i++) full_frame_buf[w++] = hdr[i];
 
     rebuild_render_next();
     for (int r = 0; r < BOARD_H; r++) {
-        for (int i = 0; render_next[r][i] && w + 1 < sizeof(full_frame_buf); i++) {
-            full_frame_buf[w++] = render_next[r][i];
-        }
+        for (int i = 0; render_next[r][i] && w + 1 < sizeof(full_frame_buf); i++) full_frame_buf[w++] = render_next[r][i];
         if (w + 1 < sizeof(full_frame_buf)) full_frame_buf[w++] = '\n';
     }
-
     full_frame_buf[w] = '\0';
 }
 
@@ -570,13 +555,11 @@ static void render_work_handler(struct k_work *work) {
             rs.clear_phase = CLP_BS;
             k_work_reschedule(&rs.work, K_MSEC(delay_action()));
             return;
-
         case CLP_BS:
             tap(BACKSPACE);
             rs.clear_phase = CLP_DONE;
             k_work_reschedule(&rs.work, K_MSEC(delay_action()));
             return;
-
         case CLP_DONE:
         default: {
             enum request_type next = rs.req;
@@ -693,8 +676,7 @@ static void render_work_handler(struct k_work *work) {
         default:
             if (rs.batch_pos + 1 < rs.batch_len) {
                 rs.batch_pos++;
-                start_replace_line_script(rs.batch[rs.batch_pos].line_index,
-                                          rs.batch[rs.batch_pos].text);
+                start_replace_line_script(rs.batch[rs.batch_pos].line_index, rs.batch[rs.batch_pos].text);
                 return;
             }
 
@@ -715,7 +697,7 @@ static void render_work_handler(struct k_work *work) {
 }
 
 /* ==============================
- * Input handling & gravity scheduling
+ * Gravity / Clear scheduling
  * ============================== */
 static void schedule_gravity_idle(void) {
     k_work_reschedule(&gravity_work, K_MSEC(idle_before_fall_ms));
@@ -729,70 +711,83 @@ static void on_user_input_common(void) {
     schedule_gravity_idle();
 }
 
-static void apply_pending_and_redraw_once(void) {
-    if (rs.running) return;
+static void begin_clear_animation(uint16_t mask) {
+    clearing = true;
+    clear_mask = mask;
+    clear_step = 0;
 
-    bool changed = false;
-
-    /* dx */
-    if (pending_dx != 0) {
-        int dx = pending_dx;
-        pending_dx = 0;
-
-        int nx = falling.x + dx;
-        if (can_place(falling.type, falling.rot, nx, falling.y)) {
-            falling.x = nx;
-            changed = true;
-        }
-    }
-
-    /* rotate cw */
-    if (pending_rot_cw > 0) {
-        pending_rot_cw = 0;
-        if (try_rotate_cw_with_kick()) changed = true;
-    }
-
-    /* soft drop */
-    if (pending_soft_drop > 0) {
-        int n = pending_soft_drop;
-        pending_soft_drop = 0;
-        for (int i = 0; i < n; i++) {
-            do_fall_one_and_handle_lock();
-            changed = true;
-        }
-    }
-
-    if (changed) request_diff_render();
-}
-
-static void on_user_dx(int dx) {
-    on_user_input_common();
-    if (rs.running) { pending_dx += dx; return; }
-
-    int nx = falling.x + dx;
-    if (can_place(falling.type, falling.rot, nx, falling.y)) {
-        falling.x = nx;
-        request_diff_render();
-    }
-}
-
-static void on_user_rotate_cw(void) {
-    on_user_input_common();
-    if (rs.running) { pending_rot_cw++; return; }
-
-    if (try_rotate_cw_with_kick()) request_diff_render();
-}
-
-static void on_user_soft_drop(void) {
-    on_user_input_common();
-    if (rs.running) { pending_soft_drop++; return; }
-
-    do_fall_one_and_handle_lock();
+    /* draw first effect immediately if possible */
     request_diff_render();
+    k_work_reschedule(&clear_work, K_MSEC(clear_frame_ms));
+}
+
+static void on_piece_landed(void) {
+    lock_falling();
+    uint16_t mask = detect_full_lines();
+    if (mask) {
+        begin_clear_animation(mask);
+        return;
+    }
+    spawn_piece();
+    request_diff_render();
+    schedule_gravity_idle();
+}
+
+static bool do_fall_one(void) {
+    int ny = falling.y + 1;
+    if (can_place(falling.type, falling.rot, falling.x, ny)) {
+        falling.y = ny;
+        return true;
+    }
+    return false;
+}
+
+static void hard_drop_and_land(void) {
+    while (do_fall_one()) {
+        /* keep falling */
+    }
+    on_piece_landed();
+}
+
+static void clear_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    if (!clearing) return;
+
+    if (rs.running) {
+        k_work_reschedule(&clear_work, K_MSEC(30));
+        return;
+    }
+
+    clear_step++;
+
+    if (clear_step < clear_frames) {
+        request_diff_render();
+        k_work_reschedule(&clear_work, K_MSEC(clear_frame_ms));
+        return;
+    }
+
+    /* finish: actually clear + spawn next, then draw */
+    uint16_t mask = clear_mask;
+
+    clearing = false;
+    clear_mask = 0;
+    clear_step = 0;
+
+    apply_line_clear(mask);
+    spawn_piece();
+
+    request_diff_render();
+    schedule_gravity_idle();
 }
 
 static void gravity_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
+
+    if (clearing) {
+        k_work_reschedule(&gravity_work, K_MSEC(50));
+        return;
+    }
 
     uint32_t now = (uint32_t)k_uptime_get();
     uint32_t since_input = now - last_input_ms;
@@ -809,10 +804,107 @@ static void gravity_work_handler(struct k_work *work) {
         return;
     }
 
-    /* fall */
-    do_fall_one_and_handle_lock();
-    request_diff_render();
-    schedule_gravity_interval();
+    if (do_fall_one()) {
+        request_diff_render();
+        schedule_gravity_interval();
+        return;
+    }
+
+    /* landed */
+    on_piece_landed();
+}
+
+/* ==============================
+ * Input handling (queue while rendering / clearing)
+ * ============================== */
+static void apply_pending_and_redraw_once(void) {
+    if (rs.running || clearing) return;
+
+    bool changed = false;
+
+    /* dx */
+    if (pending_dx != 0) {
+        int dx = pending_dx;
+        pending_dx = 0;
+
+        int nx = falling.x + dx;
+        if (can_place(falling.type, falling.rot, nx, falling.y)) {
+            falling.x = nx;
+            changed = true;
+        }
+    }
+
+    /* rotate: apply CCW first if queued, then CW */
+    while (pending_rot_ccw > 0) {
+        pending_rot_ccw--;
+        if (try_rotate(-1)) changed = true;
+    }
+    while (pending_rot_cw > 0) {
+        pending_rot_cw--;
+        if (try_rotate(+1)) changed = true;
+    }
+
+    /* hard drop overrides */
+    if (pending_hard_drop) {
+        pending_hard_drop = false;
+        hard_drop_and_land();
+        return; // landing path already schedules draw
+    }
+
+    /* soft drop */
+    if (pending_soft_drop > 0) {
+        int n = pending_soft_drop;
+        pending_soft_drop = 0;
+        for (int i = 0; i < n; i++) {
+            if (do_fall_one()) {
+                changed = true;
+            } else {
+                on_piece_landed();
+                return;
+            }
+        }
+        changed = true;
+    }
+
+    if (changed) request_diff_render();
+}
+
+static void on_user_dx(int dx) {
+    on_user_input_common();
+    if (rs.running || clearing) { pending_dx += dx; return; }
+
+    int nx = falling.x + dx;
+    if (can_place(falling.type, falling.rot, nx, falling.y)) {
+        falling.x = nx;
+        request_diff_render();
+    }
+}
+
+static void on_user_rotate(int dir) {
+    on_user_input_common();
+    if (rs.running || clearing) {
+        if (dir > 0) pending_rot_cw++;
+        else pending_rot_ccw++;
+        return;
+    }
+    if (try_rotate(dir)) request_diff_render();
+}
+
+static void on_user_soft_drop(void) {
+    on_user_input_common();
+    if (rs.running || clearing) { pending_soft_drop++; return; }
+
+    if (do_fall_one()) {
+        request_diff_render();
+    } else {
+        on_piece_landed();
+    }
+}
+
+static void on_user_hard_drop(void) {
+    on_user_input_common();
+    if (rs.running || clearing) { pending_hard_drop = true; return; }
+    hard_drop_and_land();
 }
 
 /* ==============================
@@ -826,16 +918,20 @@ static void reset_game(void) {
 
     pending_dx = 0;
     pending_rot_cw = 0;
+    pending_rot_ccw = 0;
     pending_soft_drop = 0;
+    pending_hard_drop = false;
+
+    clearing = false;
+    clear_mask = 0;
+    clear_step = 0;
 
     last_input_ms = (uint32_t)k_uptime_get();
 
     spawn_piece();
 
     rebuild_render_next();
-    for (int r = 0; r < BOARD_H; r++) {
-        for (int i = 0; i < BOARD_W + 2; i++) render_prev[r][i] = '\0';
-    }
+    for (int r = 0; r < BOARD_H; r++) for (int i = 0; i < BOARD_W + 2; i++) render_prev[r][i] = '\0';
 }
 
 /* ==============================
@@ -846,8 +942,10 @@ static void reset_game(void) {
  * 1: async clear editor
  * 10: left
  * 11: right
- * 12: rotate CW (with wall-kick)
+ * 12: rotate CW (wall-kick)
  * 13: soft drop (1 step)
+ * 14: rotate CCW (wall-kick)
+ * 15: hard drop
  * ============================== */
 static int on_pressed(struct zmk_behavior_binding *binding,
                       struct zmk_behavior_binding_event event) {
@@ -858,6 +956,7 @@ static int on_pressed(struct zmk_behavior_binding *binding,
     if (!rs.inited) {
         k_work_init_delayable(&rs.work, render_work_handler);
         k_work_init_delayable(&gravity_work, gravity_work_handler);
+        k_work_init_delayable(&clear_work, clear_work_handler);
         rs.inited = true;
     }
 
@@ -867,6 +966,7 @@ static int on_pressed(struct zmk_behavior_binding *binding,
     case 0:
         stop_render();
         k_work_cancel_delayable(&gravity_work);
+        k_work_cancel_delayable(&clear_work);
 
         reset_game();
         build_full_frame_text();
@@ -878,6 +978,7 @@ static int on_pressed(struct zmk_behavior_binding *binding,
     case 1:
         stop_render();
         k_work_cancel_delayable(&gravity_work);
+        k_work_cancel_delayable(&clear_work);
 
         start_clear_editor_async(REQ_CLEAR_ONLY);
         return ZMK_BEHAVIOR_OPAQUE;
@@ -891,11 +992,19 @@ static int on_pressed(struct zmk_behavior_binding *binding,
         return ZMK_BEHAVIOR_OPAQUE;
 
     case 12:
-        on_user_rotate_cw();
+        on_user_rotate(+1);
         return ZMK_BEHAVIOR_OPAQUE;
 
     case 13:
         on_user_soft_drop();
+        return ZMK_BEHAVIOR_OPAQUE;
+
+    case 14:
+        on_user_rotate(-1);
+        return ZMK_BEHAVIOR_OPAQUE;
+
+    case 15:
+        on_user_hard_drop();
         return ZMK_BEHAVIOR_OPAQUE;
 
     default:

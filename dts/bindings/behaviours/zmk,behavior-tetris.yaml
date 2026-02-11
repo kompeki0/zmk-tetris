@@ -1,0 +1,9 @@
+description: Tetris renderer behavior (VS Code ASCII)
+
+compatible: "zmk,behavior-tetris"
+
+include: one_param.yaml
+
+properties:
+  "#binding-cells":
+    const: 1

@@ -556,7 +556,7 @@ static int on_pressed(struct zmk_behavior_binding *binding,
 
     switch (cmd) {
     case 0: /* RESET + FULL REDRAW */
-        tap(A)
+        tap(A);
         stop_render();
         k_work_cancel_delayable(&gravity_work);
         reset_game();
@@ -565,7 +565,7 @@ static int on_pressed(struct zmk_behavior_binding *binding,
         return ZMK_BEHAVIOR_OPAQUE;
 
     case 1: /* CLEAR */
-        tap(B)
+        tap(B);
         stop_render();
         k_work_cancel_delayable(&gravity_work);
         clear_editor();

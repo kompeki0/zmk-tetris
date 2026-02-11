@@ -730,16 +730,6 @@ static void build_full_frame_text(void) {
     full_frame_buf[w] = '\0';
 }
 
-static void force_redraw_all(void) {
-    /* render_prevを全消しして差分を“全行”にする */
-    for (int r = 0; r < BOARD_H; r++) {
-        for (int i = 0; i < BOARD_W + 2; i++) render_prev[r][i] = '\0';
-    }
-    score_prev[0] = '\0'; /* scoreも必ず更新させる */
-
-    request_diff_render();
-}
-
 
 /* build a combined diff batch: score line + board lines */
 static void request_diff_render(void) {
@@ -772,6 +762,17 @@ static void request_diff_render(void) {
 
     if (len == 0) return;
     start_batch(lines, len);
+}
+
+
+static void force_redraw_all(void) {
+    /* render_prevを全消しして差分を“全行”にする */
+    for (int r = 0; r < BOARD_H; r++) {
+        for (int i = 0; i < BOARD_W + 2; i++) render_prev[r][i] = '\0';
+    }
+    score_prev[0] = '\0'; /* scoreも必ず更新させる */
+
+    request_diff_render();
 }
 
 static void render_work_handler(struct k_work *work) {

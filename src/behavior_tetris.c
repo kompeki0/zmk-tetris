@@ -24,7 +24,7 @@ static inline void release(uint32_t keycode) {
 }
 static inline void tap(uint32_t keycode) {
     press(keycode);
-    k_msleep(1);         // ← 安定化（短い押下）
+    k_msleep(1); // ← 安定化（短い押下）
     release(keycode);
 }
 static inline void tap_with_mod(uint32_t mod, uint32_t key) {
@@ -139,6 +139,12 @@ struct render_state {
 };
 
 static struct render_state rs;
+
+/* ============ animation (auto transition) ============ */
+static bool anim_running;
+static uint16_t anim_interval_ms = 220; // 150〜400msで好みに調整
+static uint8_t anim_idx;
+static struct k_work_delayable anim_work;
 
 /* 遅延（崩れたらここを増やす） */
 static uint32_t delay_for_char(char c) {
@@ -275,6 +281,38 @@ static void render_work_handler(struct k_work *work) {
     rs.running = false;
 }
 
+/* ---------- animation tick handler ---------- */
+static void anim_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    if (!anim_running) {
+        return;
+    }
+
+    /* 描画中なら、少し待ってやり直す（競合防止） */
+    if (rs.running) {
+        k_work_reschedule(&anim_work, K_MSEC(30));
+        return;
+    }
+
+    const char *line = line_variants[anim_idx % LINE_VARIANTS_LEN];
+    anim_idx = (anim_idx + 1) % LINE_VARIANTS_LEN;
+
+    start_replace_line(TARGET_LINE_INDEX, line);
+
+    k_work_reschedule(&anim_work, K_MSEC(anim_interval_ms));
+}
+
+static void anim_start(void) {
+    anim_running = true;
+    k_work_reschedule(&anim_work, K_NO_WAIT);
+}
+
+static void anim_stop(void) {
+    anim_running = false;
+    k_work_cancel_delayable(&anim_work);
+}
+
 /* ============ behavior entry ============ */
 static int on_pressed(struct zmk_behavior_binding *binding,
                       struct zmk_behavior_binding_event event) {
@@ -284,6 +322,7 @@ static int on_pressed(struct zmk_behavior_binding *binding,
 
     if (!rs.inited) {
         k_work_init_delayable(&rs.work, render_work_handler);
+        k_work_init_delayable(&anim_work, anim_work_handler);
         rs.inited = true;
     }
 
@@ -291,34 +330,49 @@ static int on_pressed(struct zmk_behavior_binding *binding,
 
     switch (cmd) {
     case 0: /* FULL DRAW */
+        anim_stop();
         stop_render();
+        anim_idx = 0;
         clear_editor();
         start_full_text(frame0);
         return ZMK_BEHAVIOR_OPAQUE;
 
     case 1: /* CLEAR */
+        anim_stop();
         stop_render();
         clear_editor();
         return ZMK_BEHAVIOR_OPAQUE;
 
     case 2: /* DIFF: variant 0 */
+        anim_stop();
         stop_render();
         start_replace_line(TARGET_LINE_INDEX, line_variants[0]);
         return ZMK_BEHAVIOR_OPAQUE;
 
     case 3: /* DIFF: variant 1 */
+        anim_stop();
         stop_render();
         start_replace_line(TARGET_LINE_INDEX, line_variants[1]);
         return ZMK_BEHAVIOR_OPAQUE;
 
     case 4: /* DIFF: variant 2 */
+        anim_stop();
         stop_render();
         start_replace_line(TARGET_LINE_INDEX, line_variants[2]);
         return ZMK_BEHAVIOR_OPAQUE;
 
     case 5: /* DIFF: variant 3 */
+        anim_stop();
         stop_render();
         start_replace_line(TARGET_LINE_INDEX, line_variants[3]);
+        return ZMK_BEHAVIOR_OPAQUE;
+
+    case 6: /* ANIM TOGGLE */
+        if (anim_running) {
+            anim_stop();
+        } else {
+            anim_start();
+        }
         return ZMK_BEHAVIOR_OPAQUE;
 
     default:

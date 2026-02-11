@@ -30,7 +30,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
  */
 #define BOARD_TOP_LINE_INDEX 3
 
-#define MAX_UPDATE_LINES 10
+#define MAX_UPDATE_LINES 16
 #define UPDATE_TEXT_MAX 32  /* score line etc */
 
 static uint16_t idle_before_fall_ms = 2000;

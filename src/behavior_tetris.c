@@ -133,10 +133,10 @@ static uint32_t last_input_ms;
  * 4x4 masks (bit 0 = (0,0), bit 15 = (3,3))
  * SRS-like orientations (CW)
  * ============================== */
-static inline uint16_t bit_at(int r, int c) { return (uint16_t)(1u << (r * 4 + c)); }
+#define BIT_AT(r, c) ((uint16_t)(1u << (((r) * 4) + (c))))
 
 /* Helper to read bit from mask */
-static inline bool mask_has(uint16_t m, int r, int c) { return (m & bit_at(r, c)) != 0; }
+static inline bool mask_has(uint16_t m, int r, int c) { return (m & BIT_AT(r, c)) != 0; }
 
 /*
  * Masks are defined within 4x4.
@@ -146,55 +146,55 @@ static const uint16_t SHAPE[TET_COUNT][4] = {
     /* I */
     {
         /* rot 0 */
-        bit_at(1,0) | bit_at(1,1) | bit_at(1,2) | bit_at(1,3),
+        BIT_AT(1,0) | BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3),
         /* rot 1 */
-        bit_at(0,2) | bit_at(1,2) | bit_at(2,2) | bit_at(3,2),
+        BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(3,2),
         /* rot 2 */
-        bit_at(2,0) | bit_at(2,1) | bit_at(2,2) | bit_at(2,3),
+        BIT_AT(2,0) | BIT_AT(2,1) | BIT_AT(2,2) | BIT_AT(2,3),
         /* rot 3 */
-        bit_at(0,1) | bit_at(1,1) | bit_at(2,1) | bit_at(3,1),
+        BIT_AT(0,1) | BIT_AT(1,1) | BIT_AT(2,1) | BIT_AT(3,1),
     },
     /* O */
     {
-        bit_at(1,1) | bit_at(1,2) | bit_at(2,1) | bit_at(2,2),
-        bit_at(1,1) | bit_at(1,2) | bit_at(2,1) | bit_at(2,2),
-        bit_at(1,1) | bit_at(1,2) | bit_at(2,1) | bit_at(2,2),
-        bit_at(1,1) | bit_at(1,2) | bit_at(2,1) | bit_at(2,2),
+        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(2,1) | BIT_AT(2,2),
+        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(2,1) | BIT_AT(2,2),
+        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(2,1) | BIT_AT(2,2),
+        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(2,1) | BIT_AT(2,2),
     },
     /* T */
     {
-        bit_at(1,1) | bit_at(1,2) | bit_at(1,3) | bit_at(2,2),
-        bit_at(0,2) | bit_at(1,2) | bit_at(2,2) | bit_at(1,3),
-        bit_at(1,1) | bit_at(1,2) | bit_at(1,3) | bit_at(0,2),
-        bit_at(0,2) | bit_at(1,2) | bit_at(2,2) | bit_at(1,1),
+        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,2),
+        BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(1,3),
+        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(0,2),
+        BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(1,1),
     },
     /* S */
     {
-        bit_at(1,2) | bit_at(1,3) | bit_at(2,1) | bit_at(2,2),
-        bit_at(0,2) | bit_at(1,2) | bit_at(1,3) | bit_at(2,3),
-        bit_at(1,2) | bit_at(1,3) | bit_at(2,1) | bit_at(2,2),
-        bit_at(0,2) | bit_at(1,2) | bit_at(1,3) | bit_at(2,3),
+        BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,1) | BIT_AT(2,2),
+        BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,3),
+        BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,1) | BIT_AT(2,2),
+        BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,3),
     },
     /* Z */
     {
-        bit_at(1,1) | bit_at(1,2) | bit_at(2,2) | bit_at(2,3),
-        bit_at(0,3) | bit_at(1,2) | bit_at(1,3) | bit_at(2,2),
-        bit_at(1,1) | bit_at(1,2) | bit_at(2,2) | bit_at(2,3),
-        bit_at(0,3) | bit_at(1,2) | bit_at(1,3) | bit_at(2,2),
+        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(2,3),
+        BIT_AT(0,3) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,2),
+        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(2,3),
+        BIT_AT(0,3) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,2),
     },
     /* J */
     {
-        bit_at(1,1) | bit_at(1,2) | bit_at(1,3) | bit_at(2,1),
-        bit_at(0,2) | bit_at(0,3) | bit_at(1,2) | bit_at(2,2),
-        bit_at(0,3) | bit_at(1,1) | bit_at(1,2) | bit_at(1,3),
-        bit_at(0,2) | bit_at(1,2) | bit_at(2,2) | bit_at(2,1),
+        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,1),
+        BIT_AT(0,2) | BIT_AT(0,3) | BIT_AT(1,2) | BIT_AT(2,2),
+        BIT_AT(0,3) | BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3),
+        BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(2,1),
     },
     /* L */
     {
-        bit_at(1,1) | bit_at(1,2) | bit_at(1,3) | bit_at(2,3),
-        bit_at(0,2) | bit_at(1,2) | bit_at(2,2) | bit_at(0,3),
-        bit_at(0,1) | bit_at(1,1) | bit_at(1,2) | bit_at(1,3),
-        bit_at(2,2) | bit_at(0,1) | bit_at(1,1) | bit_at(2,1),
+        BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,3),
+        BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(0,3),
+        BIT_AT(0,1) | BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3),
+        BIT_AT(2,2) | BIT_AT(0,1) | BIT_AT(1,1) | BIT_AT(2,1),
     },
 };
 

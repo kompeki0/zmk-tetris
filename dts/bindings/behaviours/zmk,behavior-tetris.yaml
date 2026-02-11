@@ -7,3 +7,33 @@ include: one_param.yaml
 properties:
   "#binding-cells":
     const: 1
+
+  fall-interval-ms:
+    type: int
+    default: 700
+    description: "Gravity fall interval in ms once falling starts."
+
+  idle-before-fall-ms:
+    type: int
+    default: 2000
+    description: "Delay in ms after last input before gravity starts."
+
+  draw-delay-char-ms:
+    type: int
+    default: 6
+    description: "Delay per typed character in ms."
+
+  draw-delay-enter-ms:
+    type: int
+    default: 25
+    description: "Delay for newline/enter in ms."
+
+  draw-delay-nav-ms:
+    type: int
+    default: 12
+    description: "Delay for navigation keys in ms (HOME/DOWN/etc)."
+
+  draw-delay-action-ms:
+    type: int
+    default: 18
+    description: "Delay for action keys in ms (select/delete etc)."

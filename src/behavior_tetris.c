@@ -158,12 +158,17 @@ static bool has_falling; /* false during spawn-delay to avoid showing next piece
 static uint32_t score;
 static uint16_t lines_cleared_total;
 
+/* hold/keep */
+static int8_t hold_type;     /* -1 none */
+static bool hold_used;       /* one hold per piece */
+
 /* queued inputs while rendering / clear animation / spawn delay */
 static int  pending_dx;
 static int  pending_rot_cw;
 static int  pending_rot_ccw;
 static bool pending_hard_drop;
 static int  pending_soft_drop;
+static bool pending_hold;
 static uint32_t last_input_ms;
 
 /* line clear state */
@@ -174,6 +179,53 @@ static uint8_t clear_step;
 /* spawn delay */
 static uint16_t pending_spawn_delay_ms;
 static bool last_land_was_harddrop;
+
+/* ==============================
+ * 7-bag (shuffle 7, then pop)
+ * ============================== */
+static uint8_t bag[TET_COUNT];
+static uint8_t bag_idx;
+
+static void refill_and_shuffle_bag(void) {
+    for (uint8_t i = 0; i < TET_COUNT; i++) bag[i] = i;
+
+    /* Fisher-Yates shuffle */
+    for (int i = TET_COUNT - 1; i > 0; i--) {
+        uint32_t r = sys_rand32_get();
+        int j = (int)(r % (uint32_t)(i + 1));
+        uint8_t tmp = bag[i];
+        bag[i] = bag[j];
+        bag[j] = tmp;
+    }
+    bag_idx = 0;
+}
+
+static uint8_t bag_next_type(void) {
+    if (bag_idx >= TET_COUNT) refill_and_shuffle_bag();
+    return bag[bag_idx++];
+}
+
+static uint8_t bag_peek_next_type(void) {
+    if (bag_idx >= TET_COUNT) {
+        /* NOTE: keep deterministic-ish; refill now */
+        refill_and_shuffle_bag();
+    }
+    return bag[bag_idx];
+}
+
+/* display helper */
+static char tet_char(int t) {
+    switch (t) {
+    case TET_I: return 'i';
+    case TET_O: return 'o';
+    case TET_T: return 't';
+    case TET_S: return 's';
+    case TET_Z: return 'z';
+    case TET_J: return 'j';
+    case TET_L: return 'l';
+    default: return '.';
+    }
+}
 
 /* ==============================
  * 4x4 masks (bit 0 = (0,0), bit 15 = (3,3))
@@ -217,27 +269,27 @@ static const uint16_t SHAPE[TET_COUNT][4] = {
         BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(2,3),
         BIT_AT(0,3) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,2),
     },
-    /* J (fixed: not mixed with L) */
+    /* J (fixed) */
     {
-        /* rot 0: JJJ / J.. */
+        /* rot 0: JJJ / J..  */
         BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,1),
-        /* rot 1: .J / .J / .JJ (top-right) */
-        BIT_AT(0,3) | BIT_AT(1,3) | BIT_AT(2,3) | BIT_AT(2,2),
+        /* rot 1: .J. / .J. / JJ.  (出っ張りが左下) */
+        BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(2,1),
         /* rot 2: ..J / JJJ */
         BIT_AT(0,3) | BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3),
-        /* rot 3: JJ. / .J. / .J. (bottom-left) */
-        BIT_AT(0,2) | BIT_AT(0,3) | BIT_AT(1,3) | BIT_AT(2,3),
+        /* rot 3: .JJ / .J. / .J.  (出っ張りが右上) */
+        BIT_AT(0,2) | BIT_AT(0,3) | BIT_AT(1,2) | BIT_AT(2,2),
     },
     /* L (fixed) */
     {
         /* rot 0: LLL / ..L */
         BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3) | BIT_AT(2,3),
-        /* rot 1: .LL / .L. / .L. (top-right overhang) */
-        BIT_AT(0,2) | BIT_AT(0,3) | BIT_AT(1,2) | BIT_AT(2,2),
+        /* rot 1: .L. / .L. / .LL  (出っ張りが右下) */
+        BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2) | BIT_AT(2,3),
         /* rot 2: L.. / LLL */
         BIT_AT(0,1) | BIT_AT(1,1) | BIT_AT(1,2) | BIT_AT(1,3),
-        /* rot 3: .L. / .L. / LL. (bottom-left overhang) */
-        BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,1) | BIT_AT(2,2),
+        /* rot 3: LL. / .L. / .L.  (出っ張りが左上) */
+        BIT_AT(0,1) | BIT_AT(0,2) | BIT_AT(1,2) | BIT_AT(2,2),
     },
 };
 
@@ -317,7 +369,7 @@ static bool try_rotate(int dir /* +1 CW, -1 CCW */) {
 }
 
 /* ==============================
- * Score line builder: "s 00000 l 000"
+ * Score line builder: "s 00000 l 000 n t k l"
  * ============================== */
 static char score_prev[UPDATE_TEXT_MAX];
 static char score_next[UPDATE_TEXT_MAX];
@@ -328,8 +380,11 @@ static void build_score_next(void) {
     uint16_t l = lines_cleared_total;
     if (l > 999) l = 999;
 
-    /* keep within UPDATE_TEXT_MAX */
+    char nchar = tet_char((int)bag_peek_next_type());
+    char kchar = (hold_type < 0) ? '.' : tet_char((int)hold_type);
+
     int w = 0;
+
     score_next[w++] = 's';
     score_next[w++] = ' ';
     score_next[w++] = '0' + ((s / 10000) % 10);
@@ -337,14 +392,26 @@ static void build_score_next(void) {
     score_next[w++] = '0' + ((s / 100) % 10);
     score_next[w++] = '0' + ((s / 10) % 10);
     score_next[w++] = '0' + (s % 10);
+
     score_next[w++] = ' ';
     score_next[w++] = 'l';
     score_next[w++] = ' ';
     score_next[w++] = '0' + ((l / 100) % 10);
     score_next[w++] = '0' + ((l / 10) % 10);
     score_next[w++] = '0' + (l % 10);
+
     score_next[w++] = ' ';
-    score_next[w]   = '\0';
+    score_next[w++] = 'n';
+    score_next[w++] = ' ';
+    score_next[w++] = nchar;
+
+    score_next[w++] = ' ';
+    score_next[w++] = 'h';
+    score_next[w++] = ' ';
+    score_next[w++] = kchar;
+
+    score_next[w++] = ' ';
+    score_next[w] = '\0';
 }
 
 static bool score_equals(void) {
@@ -408,16 +475,8 @@ static void apply_line_clear(uint16_t mask) {
     for (int r = dst; r >= 0; r--) for (int c = 0; c < BOARD_W; c++) board_locked[r][c] = 0;
 }
 
-static uint8_t next_piece_counter;
-static uint8_t rand_piece_type(void) {
-    uint32_t v = sys_rand32_get();
-    uint8_t t = (uint8_t)(v % TET_COUNT);
-    if (t >= TET_COUNT) t = (next_piece_counter++) % TET_COUNT;
-    return t;
-}
-
 static void spawn_piece(void) {
-    falling.type = rand_piece_type();
+    falling.type = bag_next_type();
     falling.rot  = 0;
     falling.x = 3;
     falling.y = 0;
@@ -425,8 +484,56 @@ static void spawn_piece(void) {
     if (!can_place(falling.type, falling.rot, falling.x, falling.y)) {
         /* demo: wipe board on gameover */
         for (int r = 0; r < BOARD_H; r++) for (int c = 0; c < BOARD_W; c++) board_locked[r][c] = 0;
-        falling.type = TET_O; falling.rot = 0; falling.x = 3; falling.y = 0;
+
+        /* reset bag/hold too */
+        refill_and_shuffle_bag();
+        hold_type = -1;
+        hold_used = false;
+
+        falling.type = bag_next_type();
+        falling.rot  = 0;
+        falling.x = 3;
+        falling.y = 0;
     }
+
+    /* new falling piece allows hold again */
+    hold_used = false;
+}
+
+/* Keep operation:
+ * - once per piece (hold_used)
+ * - swap with hold slot, or store current then spawn new
+ */
+static void do_hold_action(void) {
+    if (!has_falling) return;
+    if (hold_used) return;
+
+    has_falling = false; /* hide while we swap to avoid visual glitch */
+
+    if (hold_type < 0) {
+        hold_type = (int8_t)falling.type;
+        spawn_piece(); /* consume next from bag */
+    } else {
+        int8_t tmp = hold_type;
+        hold_type = (int8_t)falling.type;
+        falling.type = (uint8_t)tmp;
+
+        falling.rot = 0;
+        falling.x = 3;
+        falling.y = 0;
+
+        if (!can_place(falling.type, falling.rot, falling.x, falling.y)) {
+            /* treat as gameover-like: wipe board and reset */
+            for (int r = 0; r < BOARD_H; r++) for (int c = 0; c < BOARD_W; c++) board_locked[r][c] = 0;
+            refill_and_shuffle_bag();
+            hold_type = -1;
+            hold_used = false;
+            spawn_piece();
+        }
+    }
+
+    hold_used = true;
+    has_falling = true;
 }
 
 /* ==============================
@@ -853,17 +960,15 @@ static bool do_fall_one(void) {
 }
 
 static void on_piece_landed(void) {
-    /* lock current piece; hide piece immediately to avoid “next piece appears early” */
     lock_falling();
     has_falling = false;
 
     uint16_t mask = detect_full_lines();
     if (mask) {
-        /* score update at clear-start (once) */
         uint8_t cleared = popcount16(mask);
         lines_cleared_total = (uint16_t)(lines_cleared_total + cleared);
 
-        /* classic-ish table: 1=100,2=300,3=500,4=800 */
+        /* 1=100,2=300,3=500,4=800 */
         static const uint16_t tbl[5] = {0, 100, 300, 500, 800};
         score += tbl[cleared <= 4 ? cleared : 4];
 
@@ -871,7 +976,6 @@ static void on_piece_landed(void) {
         return;
     }
 
-    /* no clear: delay before spawning (hard drop has bigger delay) */
     begin_spawn_delay(last_land_was_harddrop ? post_hard_drop_delay_ms : post_land_spawn_delay_ms);
 }
 
@@ -900,7 +1004,6 @@ static void clear_work_handler(struct k_work *work) {
         return;
     }
 
-    /* finish: apply clear, then delay spawn */
     uint16_t mask = clear_mask;
 
     clearing = false;
@@ -909,7 +1012,6 @@ static void clear_work_handler(struct k_work *work) {
 
     apply_line_clear(mask);
 
-    /* after actually cleared, wait a bit more before spawning */
     begin_spawn_delay(post_clear_spawn_delay_ms);
 }
 
@@ -942,7 +1044,6 @@ static void gravity_work_handler(struct k_work *work) {
         return;
     }
     if (!has_falling) {
-        /* in spawn delay; don't fall */
         k_work_reschedule(&gravity_work, K_MSEC(50));
         return;
     }
@@ -968,7 +1069,6 @@ static void gravity_work_handler(struct k_work *work) {
         return;
     }
 
-    /* landed */
     last_land_was_harddrop = false;
     on_piece_landed();
 }
@@ -978,11 +1078,17 @@ static void gravity_work_handler(struct k_work *work) {
  * ============================== */
 static void apply_pending_and_redraw_once(void) {
     if (rs.running || clearing) return;
-
-    /* if we're in spawn delay (no falling), just keep inputs queued */
     if (!has_falling) return;
 
     bool changed = false;
+
+    if (pending_hold) {
+        pending_hold = false;
+        do_hold_action();
+        request_diff_render();
+        /* hold consumes action; still allow other queued inputs next cycle */
+        return;
+    }
 
     /* dx */
     if (pending_dx != 0) {
@@ -1073,6 +1179,13 @@ static void on_user_hard_drop(void) {
     hard_drop_and_land();
 }
 
+static void on_user_hold(void) {
+    on_user_input_common();
+    if (rs.running || clearing || !has_falling) { pending_hold = true; return; }
+    do_hold_action();
+    request_diff_render();
+}
+
 /* ==============================
  * Init/reset
  * ============================== */
@@ -1087,11 +1200,17 @@ static void reset_game(void) {
     lines_cleared_total = 0;
     score_prev[0] = '\0';
 
+    /* bag + hold */
+    refill_and_shuffle_bag();
+    hold_type = -1;
+    hold_used = false;
+
     pending_dx = 0;
     pending_rot_cw = 0;
     pending_rot_ccw = 0;
     pending_soft_drop = 0;
     pending_hard_drop = false;
+    pending_hold = false;
 
     clearing = false;
     clear_mask = 0;
@@ -1106,7 +1225,9 @@ static void reset_game(void) {
     has_falling = true;
 
     rebuild_render_next();
-    for (int r = 0; r < BOARD_H; r++) for (int i = 0; i < BOARD_W + 2; i++) render_prev[r][i] = '\0';
+    for (int r = 0; r < BOARD_H; r++)
+        for (int i = 0; i < BOARD_W + 2; i++)
+            render_prev[r][i] = '\0';
 }
 
 /* ==============================
@@ -1121,6 +1242,7 @@ static void reset_game(void) {
  * 13: soft drop
  * 14: rotate CCW
  * 15: hard drop
+ * 16: HOLD (keep)
  * ============================== */
 static int on_pressed(struct zmk_behavior_binding *binding,
                       struct zmk_behavior_binding_event event) {
@@ -1183,6 +1305,10 @@ static int on_pressed(struct zmk_behavior_binding *binding,
 
     case 15:
         on_user_hard_drop();
+        return ZMK_BEHAVIOR_OPAQUE;
+
+    case 16:
+        on_user_hold();
         return ZMK_BEHAVIOR_OPAQUE;
 
     default:

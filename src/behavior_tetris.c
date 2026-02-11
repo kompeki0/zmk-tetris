@@ -16,7 +16,6 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
-/* ---- low level key press/release via event ---- */
 static inline void press(uint32_t keycode, uint32_t ts) {
     raise_zmk_keycode_state_changed_from_encoded(keycode, true, ts);
 }
@@ -27,15 +26,12 @@ static inline void tap(uint32_t keycode, uint32_t ts) {
     press(keycode, ts);
     release(keycode, ts);
 }
-
-/* Ctrl+A, Ctrl+Home など “修飾付き” を確実に打つ */
 static void tap_with_mod(uint32_t mod, uint32_t key, uint32_t ts) {
     press(mod, ts);
     tap(key, ts);
     release(mod, ts);
 }
 
-/* char -> keycode（まずはshift不要のみ） */
 static bool char_to_keycode(char c, uint32_t *out) {
     switch (c) {
     case 'x': *out = X; return true;
@@ -56,22 +52,13 @@ static bool char_to_keycode(char c, uint32_t *out) {
     }
 }
 
-static void type_string(const char *s, uint32_t ts) {
-    for (const char *p = s; *p; p++) {
-        uint32_t kc;
-        if (char_to_keycode(*p, &kc)) {
-            tap(kc, ts);
-        }
-    }
-}
-
-/* VS Code: Ctrl+A → Backspace が安定 */
+/* VS Code: Ctrl+A → Backspace */
 static void clear_editor(uint32_t ts) {
     tap_with_mod(LCTRL, A, ts);
     tap(BACKSPACE, ts);
 }
 
-/* 盤面（固定） */
+/* 固定フレーム */
 static const char *frame0 =
 "tetris (zmk)\n"
 "score 0000\n"
@@ -87,19 +74,73 @@ static const char *frame0 =
 ".......... \n"
 ".......... \n";
 
+/* ---- render work (send slowly) ---- */
+struct tetris_render_state {
+    bool inited;
+    bool running;
+    const char *text;
+    size_t idx;
+    uint32_t ts;
+    struct k_work_delayable work;
+};
+
+static struct tetris_render_state rs;
+
+static void render_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    if (!rs.running || rs.text == NULL) {
+        return;
+    }
+
+    char c = rs.text[rs.idx];
+    if (c == '\0') {
+        rs.running = false;
+        return;
+    }
+
+    uint32_t kc;
+    if (char_to_keycode(c, &kc)) {
+        tap(kc, (uint32_t)k_uptime_get());
+    }
+    rs.idx++;
+
+    // ここが心臓部：少し待って次の文字
+    k_work_reschedule(&rs.work, K_MSEC(3));  // 2〜5msくらいで調整
+}
+
+static void start_render(const char *text) {
+    if (!rs.inited) {
+        k_work_init_delayable(&rs.work, render_work_handler);
+        rs.inited = true;
+    }
+    rs.text = text;
+    rs.idx = 0;
+    rs.running = true;
+    k_work_reschedule(&rs.work, K_NO_WAIT);
+}
+
+static void stop_render(void) {
+    rs.running = false;
+    // 実際にはcancelしてもOK
+    k_work_cancel_delayable(&rs.work);
+}
+
 static int on_pressed(struct zmk_behavior_binding *binding,
                       struct zmk_behavior_binding_event event) {
-    uint32_t cmd = binding->param1; // 0=start, 1=clear
+    uint32_t cmd = binding->param1;
 
     LOG_DBG("tetris cmd=%d", cmd);
 
     switch (cmd) {
     case 0: // START
+        stop_render();
         clear_editor(event.timestamp);
-        type_string(frame0, event.timestamp);
+        start_render(frame0);
         return ZMK_BEHAVIOR_OPAQUE;
 
     case 1: // CLEAR
+        stop_render();
         clear_editor(event.timestamp);
         return ZMK_BEHAVIOR_OPAQUE;
 

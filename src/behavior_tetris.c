@@ -10,40 +10,32 @@
 #include <drivers/behavior.h>
 
 #include <zmk/behavior.h>
-#include <zmk/behavior_queue.h>
 #include <zmk/events/keycode_state_changed.h>
 
 #include <dt-bindings/zmk/keys.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
-/* ---- helpers: send key taps via behavior_queue ---- */
-
-static const char *kp_dev = DEVICE_DT_NAME(DT_NODELABEL(key_press));
-
-static inline struct zmk_behavior_binding kp(uint32_t keycode) {
-    return (struct zmk_behavior_binding){
-        .behavior_dev = kp_dev,
-        .param1 = keycode,
-        .param2 = 0,
-    };
+/* ---- low level key press/release via event ---- */
+static inline void press(uint32_t keycode, uint32_t ts) {
+    raise_zmk_keycode_state_changed_from_encoded(keycode, true, ts);
+}
+static inline void release(uint32_t keycode, uint32_t ts) {
+    raise_zmk_keycode_state_changed_from_encoded(keycode, false, ts);
+}
+static inline void tap(uint32_t keycode, uint32_t ts) {
+    press(keycode, ts);
+    release(keycode, ts);
 }
 
-static void tap(struct zmk_behavior_binding_event *ev, uint32_t keycode) {
-    struct zmk_behavior_binding b = kp(keycode);
-    zmk_behavior_queue_add(ev, b, true, 0);
-    zmk_behavior_queue_add(ev, b, false, 0);
+/* Ctrl+A, Ctrl+Home など “修飾付き” を確実に打つ */
+static void tap_with_mod(uint32_t mod, uint32_t key, uint32_t ts) {
+    press(mod, ts);
+    tap(key, ts);
+    release(mod, ts);
 }
 
-/* Ctrl+A */
-static void ctrl_a(struct zmk_behavior_binding_event *ev) {
-    // 「修飾キー込みのエンコード」をCで作るのは流派が複数あるので、
-    // まずは確実策：Aを押す前に LCTRL を押して、後で離す（低レベル方式）
-    tap(ev, LCTRL); // ← これは “タップ” なのでダメに見えるけど、ZMKのkpは押下/解放として扱える
-    // ↑ここが気になる場合は、下の「より確実なCtrl修飾方式」を使う（後述）
-}
-
-/* char -> keycode（shift不要文字だけ） */
+/* char -> keycode（まずはshift不要のみ） */
 static bool char_to_keycode(char c, uint32_t *out) {
     switch (c) {
     case 'x': *out = X; return true;
@@ -64,16 +56,22 @@ static bool char_to_keycode(char c, uint32_t *out) {
     }
 }
 
-static void type_string(struct zmk_behavior_binding_event *ev, const char *s) {
+static void type_string(const char *s, uint32_t ts) {
     for (const char *p = s; *p; p++) {
         uint32_t kc;
         if (char_to_keycode(*p, &kc)) {
-            tap(ev, kc);
+            tap(kc, ts);
         }
     }
 }
 
-/* 盤面（まずは固定） */
+/* VS Code: Ctrl+A → Backspace が安定 */
+static void clear_editor(uint32_t ts) {
+    tap_with_mod(LCTRL, A, ts);
+    tap(BACKSPACE, ts);
+}
+
+/* 盤面（固定） */
 static const char *frame0 =
 "tetris (zmk)\n"
 "score 0000\n"
@@ -89,31 +87,20 @@ static const char *frame0 =
 ".......... \n"
 ".......... \n";
 
-static void clear_editor(struct zmk_behavior_binding_event *ev) {
-    // VS Codeで安定：Ctrl+A → Backspace
-    // ここは「Ctrl修飾の押しっぱなし」が必要なので、イベントを直接上げる方式に寄せます。
-    raise_zmk_keycode_state_changed_from_encoded(LCTRL, true, ev->timestamp);
-    raise_zmk_keycode_state_changed_from_encoded(A, true, ev->timestamp);
-    raise_zmk_keycode_state_changed_from_encoded(A, false, ev->timestamp);
-    raise_zmk_keycode_state_changed_from_encoded(LCTRL, false, ev->timestamp);
-
-    tap(ev, BACKSPACE);
-}
-
 static int on_pressed(struct zmk_behavior_binding *binding,
                       struct zmk_behavior_binding_event event) {
-    uint32_t cmd = binding->param1; // 0=start, 1=clear, 2=redraw etc.
+    uint32_t cmd = binding->param1; // 0=start, 1=clear
 
     LOG_DBG("tetris cmd=%d", cmd);
 
     switch (cmd) {
-    case 0: // START = clear + draw
-        clear_editor(&event);
-        type_string(&event, frame0);
+    case 0: // START
+        clear_editor(event.timestamp);
+        type_string(frame0, event.timestamp);
         return ZMK_BEHAVIOR_OPAQUE;
 
     case 1: // CLEAR
-        clear_editor(&event);
+        clear_editor(event.timestamp);
         return ZMK_BEHAVIOR_OPAQUE;
 
     default:
@@ -126,8 +113,8 @@ static const struct behavior_driver_api api = {
     .binding_released = NULL,
 };
 
-#define INST(n)                                                                 \
-    BEHAVIOR_DT_INST_DEFINE(n, NULL, NULL, NULL, NULL,                          \
+#define INST(n) \
+    BEHAVIOR_DT_INST_DEFINE(n, NULL, NULL, NULL, NULL, \
         POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &api);
 
 DT_INST_FOREACH_STATUS_OKAY(INST)

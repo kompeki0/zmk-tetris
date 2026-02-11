@@ -26,6 +26,14 @@ static inline void tap(uint32_t keycode, uint32_t ts) {
     press(keycode, ts);
     release(keycode, ts);
 }
+
+static inline void tap_slow(uint32_t keycode) {
+    uint32_t ts = (uint32_t)k_uptime_get();
+    press(keycode, ts);
+    k_msleep(1);
+    release(keycode, (uint32_t)k_uptime_get());
+}
+
 static void tap_with_mod(uint32_t mod, uint32_t key, uint32_t ts) {
     press(mod, ts);
     tap(key, ts);
@@ -89,24 +97,29 @@ static struct tetris_render_state rs;
 static void render_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
 
-    if (!rs.running || rs.text == NULL) {
-        return;
-    }
+    if (!rs.running || rs.text == NULL) return;
 
     char c = rs.text[rs.idx];
-    if (c == '\0') {
-        rs.running = false;
+    if (c == '\0') { rs.running = false; return; }
+
+    uint32_t kc;
+    uint32_t delay_ms = 6; // 普通文字は遅め
+
+    if (c == '\n') {
+        kc = ENTER;
+        delay_ms = 25; // ← ここが超効く
+        tap_slow(kc);
+        rs.idx++;
+        k_work_reschedule(&rs.work, K_MSEC(delay_ms));
         return;
     }
 
-    uint32_t kc;
     if (char_to_keycode(c, &kc)) {
-        tap(kc, (uint32_t)k_uptime_get());
+        tap_slow(kc);
     }
     rs.idx++;
 
-    // ここが心臓部：少し待って次の文字
-    k_work_reschedule(&rs.work, K_MSEC(3));  // 2〜5msくらいで調整
+    k_work_reschedule(&rs.work, K_MSEC(delay_ms));
 }
 
 static void start_render(const char *text) {
